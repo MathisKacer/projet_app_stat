@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Données brutes mises en cache localement (source: S3, cf. data/load_data.py)
+data/raw/
