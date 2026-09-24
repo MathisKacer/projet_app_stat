@@ -16,12 +16,15 @@ S3_ENDPOINT = "https://minio.lab.sspcloud.fr"
 # cellules vides ou ne contenant que des espaces.
 NA_VALUES = ("", " ")
 
+# Les décimales (poids de sondage pm17B) utilisent une virgule.
+DECIMAL = ","
+
 
 def load_escap_data() -> pd.DataFrame:
     """Télécharge et charge le jeu de données ESCAPAD depuis S3."""
     fs = s3fs.S3FileSystem(client_kwargs={"endpoint_url": S3_ENDPOINT})
     with fs.open(S3_PATH, "r") as f:
-        return pd.read_csv(f, sep=";", na_values=NA_VALUES)
+        return pd.read_csv(f, sep=";", na_values=NA_VALUES, decimal=DECIMAL)
 
 
 if __name__ == "__main__":

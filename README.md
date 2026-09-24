@@ -22,3 +22,14 @@ df = load_escap_data()
 ```
 
 Dépendances : `pandas`, `s3fs` (voir `requirements.txt`).
+
+## `notebooks/`
+
+Notebooks interactifs au format « percent » (cellules délimitées par `# %%`),
+à exécuter cellule par cellule dans VS Code (Python Interactive) ou avec
+Jupytext.
+
+- `01_visualisation.py` : statistique descriptive pondérée par `pm17B` :
+  valeurs manquantes, distribution de la cible `Q19A` et valeurs aberrantes,
+  distribution des prédicteurs, âge moyen au premier alcool par modalité,
+  profil des non-réponses à `Q19A`, V de Cramér entre prédicteurs.
