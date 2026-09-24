@@ -2,3 +2,4 @@ pandas
 s3fs
 numpy
 matplotlib
+scikit-learn

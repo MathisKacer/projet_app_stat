@@ -20,7 +20,9 @@ Chargement du jeu de données ESCAPAD.
      jamais bu) ; `Q19A` continue est conservée ;
   2. complétion de `Q04` à partir de `Q04A` / `Q04B`, modalité « Non concerné »
      pour les questions filtrées, variable de synthèse `SITUATION` ;
-  3. libellés des modalités et NA → « Non répondu » pour les autres variables.
+  3. libellés des modalités et NA → « Non répondu » pour les autres variables.- `features.py` : variables explicatives retenues pour les modèles et leur
+  encodage (`make_preprocessor()`) : scores ordinaux + indicatrice de
+  non-réponse pour les variables ordinales, one-hot pour les nominales.
 
 Utilisation (dans un notebook, par exemple) :
 
@@ -45,3 +47,7 @@ Jupytext.
 - `02_preprocessing.py` : chaque étape du prétraitement avec ses statistiques
   de contrôle (histogramme + boîte à moustaches pondérée de `Q19A`, classes
   obtenues, complétion de `Q04`, tableau de `SITUATION`, non-réponses).
+- `03_modeles.py` : prédiction de `Q19A` (jeunes ayant déjà bu) : moyenne,
+  Ridge, arbre, bagging, forêt aléatoire, gradient boosting (classique et par
+  histogrammes), stacking. Hyperparamètres par validation croisée pondérée,
+  comparaison sur un échantillon test, importance des variables par permutation.
