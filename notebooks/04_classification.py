@@ -427,3 +427,5 @@ plt.show()
 #   car elle sépare aussi les abstinents des autres (Q19A manquant pour 41 % des
 #   jeunes dont le père ne boit jamais). Viennent ensuite le sexe, les PCS des
 #   parents et la vie des parents.
+
+# %%

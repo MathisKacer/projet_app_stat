@@ -529,3 +529,5 @@ plt.show()
 #   n'ayant jamais bu, ce qui limite la population sur laquelle porte le modèle.
 # - **Variables filtrées** : `Q04A` et `Q04B` dépendent de `Q04` (V ≈ 0,6) et sont
 #   à fusionner en une seule variable « situation ».
+
+# %%
