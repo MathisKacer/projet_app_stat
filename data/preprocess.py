@@ -72,10 +72,15 @@ def _class_labels(thresholds: list[int]) -> list[str]:
     return labels
 
 
-def discretize_target(df: pd.DataFrame, n_bins: int = 4) -> pd.DataFrame:
-    """Ajoute `Q19A_CLASSE` : classes de quantiles, NA -> « Non concerné »."""
+def discretize_target(df: pd.DataFrame, n_bins: int = 4, thresholds=None) -> pd.DataFrame:
+    """Ajoute `Q19A_CLASSE` : classes de quantiles, NA -> « Non concerné ».
+
+    `thresholds` permet de fixer les seuils à la main (classe k = ]seuil_{k-1},
+    seuil_k]) au lieu de les calculer par quantiles.
+    """
     df = df.copy()
-    thresholds = target_thresholds(df, n_bins)
+    if thresholds is None:
+        thresholds = target_thresholds(df, n_bins)
     labels = _class_labels(thresholds)
     classes = pd.cut(df[TARGET], bins=[-np.inf, *thresholds, np.inf], labels=labels)
     df[TARGET_CLASS] = pd.Categorical(
@@ -139,9 +144,11 @@ def encode_missing(df: pd.DataFrame, variables=None) -> pd.DataFrame:
     return df
 
 
-def preprocess(df: pd.DataFrame, n_bins: int = 4, age_max: int = AGE_MAX) -> pd.DataFrame:
+def preprocess(
+    df: pd.DataFrame, n_bins: int = 4, age_max: int = AGE_MAX, thresholds=None
+) -> pd.DataFrame:
     """Enchaîne les trois étapes de prétraitement."""
     df = clean_target(df, age_max)
-    df = discretize_target(df, n_bins)
+    df = discretize_target(df, n_bins, thresholds)
     df = build_situation(df)
     return encode_missing(df)

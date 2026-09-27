@@ -51,6 +51,7 @@ Jupytext.
   Ridge, arbre, bagging, forêt aléatoire, gradient boosting (classique et par
   histogrammes), stacking. Hyperparamètres par validation croisée pondérée,
   comparaison sur un échantillon test, importance des variables par permutation.
-- `04_classification.py` : mêmes modèles en classification de `Q19A_CLASSE`
-  (4 classes d'âge + « Non concerné »), sur tous les jeunes. Log-loss, exactitude
+- `04_classification.py` : mêmes modèles en classification de `Q19A_CLASSE`,
+  avec 14 et 15 ans regroupés (≤ 13 / 14-15 / ≥ 16 ans + « Non concerné »,
+  seuils fixés via `preprocess(..., thresholds=[13, 15])`), sur tous les jeunes. Log-loss, exactitude
   et F1 macro pondérés, matrice de confusion, importance des variables.

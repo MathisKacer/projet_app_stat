@@ -1,12 +1,23 @@
 # %% [markdown]
 # # 04 — Classification de l'âge au premier alcool
 #
-# On prédit la version discrétisée `Q19A_CLASSE` (voir `02_preprocessing.py`) :
+# On prédit une version discrétisée de l'âge au premier alcool, en **regroupant
+# 14 et 15 ans** :
 #
 # | Classe | Contenu |
 # |---|---|
-# | ≤ 13 ans, 14 ans, 15 ans, ≥ 16 ans | classes de quantiles de l'âge au premier alcool |
+# | ≤ 13 ans | initiation précoce |
+# | 14-15 ans | âge le plus courant |
+# | ≥ 16 ans | initiation tardive |
 # | Non concerné | n'a jamais bu (`Q19A` manquant) |
+#
+# Pourquoi ce regroupement : avec le découpage en quartiles (≤ 13 / 14 / 15 /
+# ≥ 16), les modèles ne distinguaient pas les jeunes de 14 et 15 ans (mêmes
+# probabilités prédites, classe « 14 ans » jamais prédite). Les seuils (13 et
+# 15) sont donc fixés à la main et non plus par quantiles. Contrepartie : la
+# classe 14-15 ans regroupe environ 41 % des jeunes ; les scores (exactitude
+# notamment) ne sont pas comparables tels quels avec la version à 5 classes, on
+# les lit par rapport à la référence « classe majoritaire ».
 #
 # Par rapport à la régression (`03_modeles.py`) :
 #
@@ -106,7 +117,8 @@ plt.rcParams.update(
 # ## Données
 
 # %%
-df = preprocess(load_escap_data())
+THRESHOLDS = [13, 15]  # classes : ≤ 13, 14-15, ≥ 16 ans
+df = preprocess(load_escap_data(), thresholds=THRESHOLDS)
 CLASSES = list(df[TARGET_CLASS].cat.categories)
 
 X, y, w = df[FEATURES], df[TARGET_CLASS].astype(str), df[WEIGHT]
@@ -284,6 +296,8 @@ evaluate(
 # %%
 results = pd.DataFrame(RESULTS).T
 results_num = results.drop(columns="hyperparamètres").astype(float)
+baseline = results_num.loc["Classe majoritaire", "log-loss test"]
+results_num["gain log-loss vs référence (%)"] = (1 - results_num["log-loss test"] / baseline) * 100
 results_num.sort_values("log-loss test").round(4)
 
 # %%
@@ -409,21 +423,24 @@ plt.show()
 # %% [markdown]
 # ## Conclusions
 #
-# - **Gain modeste mais réel sur la référence** : la log-loss passe de 1,599
-#   (fréquences des classes) à 1,498 pour le stacking, l'exactitude de 25 %
-#   (toujours prédire « 15 ans ») à environ 33 %.
-# - **Contrairement à la régression, les méthodes d'agrégation font un peu mieux
-#   que le modèle linéaire** : log-loss 1,498 à 1,510 contre 1,513 pour la
-#   régression logistique. Le stacking est le meilleur (écart ≈ 0,015, soit
-#   environ deux écarts-types de validation croisée) : combiner des modèles
-#   différents aide un peu quand il faut séparer cinq classes.
-# - **Les extrêmes sont mieux reconnus que le milieu** : « Non concerné »
-#   (46 % bien classés) et « ≤ 13 ans » (34 %) se distinguent, alors que
-#   « 14 ans » n'est jamais prédit et que les classes centrales sont attirées
-#   vers « 15 ans », la plus fréquente. Les probabilités moyennes le confirment :
-#   31 % pour « Non concerné » chez les abstinents contre 18 % de base, alors que
-#   les classes centrales restent proches de leur fréquence de base.
-# - **La consommation d'alcool des parents domine encore plus qu'en régression**,
-#   car elle sépare aussi les abstinents des autres (Q19A manquant pour 41 % des
-#   jeunes dont le père ne boit jamais). Viennent ensuite le sexe, les PCS des
-#   parents et la vie des parents.
+# - **Gain par rapport à la référence** : la log-loss passe de 1,326 (fréquences
+#   des classes) à 1,232 pour le stacking, soit un gain de 7,0 % (contre 6,3 %
+#   avec les 5 classes 14 / 15 séparées). Le regroupement améliore donc un peu la
+#   qualité des probabilités.
+# - **Mais la classe 14-15 ans absorbe presque toutes les prédictions** : environ
+#   82 % des jeunes du test sont classés « 14-15 ans ». « ≤ 13 ans » et
+#   « ≥ 16 ans » ne sont presque jamais prédits (F1 ≈ 0,04) ; seule la classe
+#   « Non concerné » reste reconnue (43 % bien classés, F1 ≈ 0,47).
+#   L'exactitude (45 %) ne dépasse la référence « toujours 14-15 ans » (41 %)
+#   que de 4 points.
+# - **Lecture** : aucun profil n'est assez marqué pour que le modèle donne plus de
+#   probabilité à « ≤ 13 ans » ou à « ≥ 16 ans » qu'à la classe majoritaire. Le
+#   signal existe (probabilités mieux calibrées que la référence) mais il est
+#   trop faible pour changer la classe prédite, sauf pour les abstinents.
+# - **Modèles** : comme avec 5 classes, les méthodes d'agrégation font un peu
+#   mieux que la régression logistique (gain de 6,6 à 7,0 % contre 5,9 %), le
+#   stacking en tête ; bagging, forêt et boosting sont à égalité compte tenu de
+#   l'écart-type de validation croisée (≈ 0,006).
+# - **Piste** : pour mieux repérer les précoces et les tardifs, on peut modifier
+#   la règle de décision (seuils sur les probabilités, ou `class_weight` pour
+#   rééquilibrer les classes), au prix d'une exactitude plus faible.
