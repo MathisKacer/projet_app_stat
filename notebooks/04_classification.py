@@ -43,7 +43,9 @@
 #   prédire toujours les mêmes classes).
 # - Apprentissage et métriques pondérés par `pm17B` : log-loss, exactitude,
 #   F1 macro (moyenne des F1 de chaque classe, sensible aux classes peu
-#   prédites).
+#   prédites) et AUC macro One-vs-Rest (moyenne des AUC « classe k contre les
+#   autres » : capacité des probabilités à classer les individus, sans dépendre
+#   de la classe prédite).
 
 # %%
 import sys
@@ -65,10 +67,12 @@ from sklearn.ensemble import (
 )
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, log_loss
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, log_loss, roc_auc_score
 from sklearn.model_selection import ParameterGrid, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import LabelEncoder
 from sklearn.tree import DecisionTreeClassifier
+from xgboost import XGBClassifier
 
 ROOT = Path.cwd() if (Path.cwd() / "data").is_dir() else Path.cwd().parent
 sys.path.insert(0, str(ROOT))
@@ -182,6 +186,7 @@ def evaluate(name, estimator, grid=None):
     pipe = make_pipe(clone(estimator).set_params(**best["params"]))
     pipe.fit(X_train, y_train, model__sample_weight=w_train.to_numpy())
     pred = pipe.predict(X_test)
+    proba = pipe.predict_proba(X_test)
     FITTED[name] = pipe
     RESULTS[name] = {
         "log-loss CV": best["logloss_cv"],
@@ -189,6 +194,8 @@ def evaluate(name, estimator, grid=None):
         "log-loss test": weighted_log_loss(pipe, X_test, y_test, w_test),
         "exactitude test": accuracy_score(y_test, pred, sample_weight=w_test),
         "F1 macro test": f1_score(y_test, pred, average="macro", sample_weight=w_test),
+        "AUC macro test": roc_auc_score(y_test, proba, multi_class="ovr", average="macro",
+                                        sample_weight=w_test, labels=pipe.classes_),
         "temps (s)": time.time() - start,
         "hyperparamètres": best["params"],
     }
@@ -202,7 +209,15 @@ def evaluate(name, estimator, grid=None):
 #
 # - **Classe majoritaire** (probabilités = fréquences des classes) : ce qu'il faut
 #   battre.
-# - **Régression logistique multinomiale** pénalisée (L2, paramètre `C`).
+# - **Régressions logistiques multinomiales pénalisées**, `C` étant l'inverse de
+#   la force de pénalité :
+#   - **ridge** (L2) : réduit tous les coefficients sans en annuler ;
+#   - **lasso** (L1) : annule une partie des coefficients (sélection de
+#     variables) ;
+#   - **elastic net** : mélange des deux, `l1_ratio` étant la part de L1.
+#
+#   Les variables ne sont pas standardisées (scores ordinaux de 1 à k et
+#   indicatrices 0/1, d'échelles proches).
 # - **Arbre de décision** seul.
 
 # %%
@@ -210,10 +225,38 @@ evaluate("Classe majoritaire", DummyClassifier(strategy="prior"))
 
 # %%
 evaluate(
-    "Régression logistique",
+    "Logistique ridge",
     LogisticRegression(max_iter=5000),
     {"C": [float(c) for c in np.logspace(-3, 1, 9)]},
 )
+
+# %%
+evaluate(
+    "Logistique lasso",
+    LogisticRegression(l1_ratio=1.0, solver="saga", max_iter=5000),
+    {"C": [float(c) for c in np.logspace(-3, 1, 9)]},
+)
+
+# %%
+evaluate(
+    "Logistique elastic net",
+    LogisticRegression(solver="saga", max_iter=5000),
+    {"C": [float(c) for c in np.logspace(-3, 1, 9)], "l1_ratio": [0.25, 0.5, 0.75]},
+).head()
+
+# %% [markdown]
+# Nombre de coefficients non nuls (pour au moins une classe) et variables
+# entièrement écartées par le lasso et l'elastic net.
+
+# %%
+LOGITS = ("Logistique ridge", "Logistique lasso", "Logistique elastic net")
+coef_names = FITTED["Logistique ridge"].named_steps["prep"].get_feature_names_out()
+nonzero = pd.DataFrame(
+    {n: np.abs(FITTED[n].named_steps["model"].coef_).max(0) > 1e-10 for n in LOGITS},
+    index=coef_names,
+)
+print(nonzero.sum().to_string(), f"\nsur {len(coef_names)} coefficients par classe")
+nonzero[~nonzero.all(axis=1)]
 
 # %%
 evaluate(
@@ -267,6 +310,48 @@ evaluate(
 ).head()
 
 # %% [markdown]
+# ### XGBoost
+#
+# XGBoost exige des classes codées 0, 1, …, K-1 : la classe ci-dessous code et
+# décode les libellés pour s'utiliser comme les autres modèles. Même grille que
+# le gradient boosting, avec en plus le sous-échantillonnage des variables
+# (`colsample_bytree`).
+
+
+# %%
+class XGBLabelClassifier(XGBClassifier):
+    """XGBClassifier acceptant des classes textuelles."""
+
+    @property
+    def classes_(self):
+        # pendant le fit, XGBoost compare classes_ aux codes 0..K-1
+        le = getattr(self, "label_encoder_", None)
+        return le.classes_ if le is not None else np.arange(self.n_classes_)
+
+    def fit(self, X, y, **kwargs):
+        self.label_encoder_ = None
+        le = LabelEncoder().fit(y)
+        super().fit(X, le.transform(y), **kwargs)
+        self.label_encoder_ = le
+        return self
+
+    def predict(self, X):
+        return self.label_encoder_.inverse_transform(super().predict(X))
+
+
+# %%
+evaluate(
+    "XGBoost",
+    XGBLabelClassifier(subsample=0.8, tree_method="hist", n_jobs=1, random_state=SEED),
+    {
+        "learning_rate": [0.02, 0.05, 0.1],
+        "n_estimators": [100, 300, 600],
+        "max_depth": [1, 2, 3],
+        "colsample_bytree": [0.8, 1.0],
+    },
+).head()
+
+# %% [markdown]
 # ## Stacking
 #
 # Régression logistique, forêt aléatoire et boosting par histogrammes (meilleurs
@@ -275,7 +360,7 @@ evaluate(
 
 # %%
 base = [
-    ("logit", FITTED["Régression logistique"].named_steps["model"]),
+    ("logit", FITTED["Logistique ridge"].named_steps["model"]),
     ("rf", FITTED["Forêt aléatoire"].named_steps["model"]),
     ("hgb", FITTED["Hist. gradient boosting"].named_steps["model"]),
 ]
@@ -301,7 +386,7 @@ results_num["gain log-loss vs référence (%)"] = (1 - results_num["log-loss tes
 results_num.sort_values("log-loss test").round(4)
 
 # %%
-REFERENCES = ("Classe majoritaire", "Régression logistique", "Arbre")
+REFERENCES = ("Classe majoritaire", *LOGITS, "Arbre")
 order = results_num.sort_values("log-loss test", ascending=False)
 best_name = order.index[-1]
 best_ensemble = next(n for n in order.index[::-1] if n not in REFERENCES)
@@ -309,8 +394,9 @@ print(f"Meilleur modèle : {best_name} — meilleur modèle d'agrégation : {bes
 
 colors = [GREY if n in REFERENCES else BLUE for n in order.index]
 pos = np.arange(len(order))
-fig, axes = plt.subplots(1, 3, figsize=(13, 4), sharey=True)
-for ax, metric in zip(axes, ("log-loss test", "exactitude test", "F1 macro test")):
+fig, axes = plt.subplots(1, 4, figsize=(17, 4), sharey=True)
+for ax, metric in zip(axes, ("log-loss test", "exactitude test", "F1 macro test",
+                             "AUC macro test")):
     ax.hlines(pos, order[metric].min(), order[metric], color="#e4e3df", linewidth=1)
     ax.scatter(order[metric], pos, color=colors, s=45, zorder=3, edgecolor="white")
     for p_, v in zip(pos, order[metric]):
@@ -390,13 +476,36 @@ mean_proba.loc["Fréquence de base"] = base_rate
 mean_proba.round(1)
 
 # %% [markdown]
+# ### AUC par classe (One-vs-Rest)
+#
+# Pour chaque classe, probabilité qu'un jeune de cette classe reçoive une
+# probabilité prédite plus élevée pour elle qu'un jeune d'une autre classe
+# (0,5 = hasard). Contrairement au F1, elle ne dépend pas de la classe prédite :
+# elle mesure le signal même pour les classes jamais prédites.
+
+# %%
+auc_class = pd.DataFrame(
+    {
+        name: [
+            roc_auc_score(y_test == c, FITTED[name].predict_proba(X_test)[:, i],
+                          sample_weight=w_test)
+            for i, c in enumerate(FITTED[name].classes_)
+        ]
+        for name in ("Logistique ridge", "XGBoost", best_ensemble)
+    },
+    index=FITTED[best_ensemble].classes_,
+).reindex(CLASSES)
+auc_class.loc["Macro"] = auc_class.mean()
+auc_class.round(3)
+
+# %% [markdown]
 # ### Importance des variables (permutation, sur le test)
 #
 # Hausse de la log-loss pondérée quand on permute une variable.
 
 # %%
 imp = {}
-for name in ("Régression logistique", best_ensemble):
+for name in ("Logistique ridge", best_ensemble):
     r = permutation_importance(
         FITTED[name], X_test, y_test, sample_weight=w_test.to_numpy(),
         scoring="neg_log_loss", n_repeats=20, random_state=SEED, n_jobs=N_JOBS,
@@ -409,8 +518,8 @@ labels = [f"{v} · {VARIABLES[v][0]}" if v in VARIABLES else f"{v} · Situation 
 fig, ax = plt.subplots(figsize=(8, 5))
 pos = np.arange(len(imp))
 ax.barh(pos + 0.2, imp[best_ensemble], height=0.38, color=BLUE, label=best_ensemble)
-ax.barh(pos - 0.2, imp["Régression logistique"], height=0.38, color=GREY,
-        label="Régression logistique")
+ax.barh(pos - 0.2, imp["Logistique ridge"], height=0.38, color=GREY,
+        label="Logistique ridge")
 ax.set_yticks(pos, labels)
 ax.axvline(0, color=TEXT, linewidth=0.8)
 ax.set_xlabel("Hausse de la log-loss quand la variable est permutée")
@@ -437,10 +546,24 @@ plt.show()
 #   probabilité à « ≤ 13 ans » ou à « ≥ 16 ans » qu'à la classe majoritaire. Le
 #   signal existe (probabilités mieux calibrées que la référence) mais il est
 #   trop faible pour changer la classe prédite, sauf pour les abstinents.
+# - **AUC** : l'AUC macro One-vs-Rest n'est que de 0,65 pour le stacking (0,50
+#   pour la référence). Par classe, les abstinents sont les mieux repérés (0,74),
+#   puis les précoces (0,67) ; les classes « 14-15 ans » (0,61) et « ≥ 16 ans »
+#   (0,59) sont à peine mieux séparées qu'au hasard. Le signal sur les précoces
+#   existe donc, même si la classe n'est presque jamais prédite.
 # - **Modèles** : comme avec 5 classes, les méthodes d'agrégation font un peu
-#   mieux que la régression logistique (gain de 6,6 à 7,0 % contre 5,9 %), le
-#   stacking en tête ; bagging, forêt et boosting sont à égalité compte tenu de
-#   l'écart-type de validation croisée (≈ 0,006).
+#   mieux que les régressions logistiques (gain de 6,6 à 7,0 % contre 5,9 %), le
+#   stacking en tête ; bagging, forêt, boosting et XGBoost sont à égalité compte
+#   tenu de l'écart-type de validation croisée (≈ 0,006). XGBoost retrouve les
+#   mêmes réglages que le gradient boosting (arbres de profondeur 2, 600
+#   itérations, pas de 0,02) et les mêmes scores (log-loss 1,235, AUC 0,649),
+#   en 5 fois moins de temps.
+# - **Ridge, lasso, elastic net** : scores identiques (log-loss 1,247-1,248,
+#   AUC 0,645-0,646). Le lasso (C = 0,1) ne garde que 41 coefficients sur 70 :
+#   il écarte les indicatrices de non-réponse et une partie des modalités de
+#   `SITUATION`, du lieu de vie, de la vie, de la situation et de la PCS des
+#   parents, sans perte de performance. Ces modalités n'apportent donc rien de plus une fois
+#   les autres connues, ce qui rejoint l'importance par permutation.
 # - **Piste** : pour mieux repérer les précoces et les tardifs, on peut modifier
 #   la règle de décision (seuils sur les probabilités, ou `class_weight` pour
 #   rééquilibrer les classes), au prix d'une exactitude plus faible.
