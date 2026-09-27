@@ -1,26 +1,25 @@
-from pathlib import Path
-
-contenu = r"""
 ---
 title: "L'âge au premier alcool"
 author: "Kacer Mathis, Leal-Fernandes Marylou"
-format: html
+format:
+  html:
+    embed-resources: true
 jupyter: python3
 ---
 
 # Introduction
 
-L'objectif de ce rapport est de prédire les déterminents de l'âge au premier alcool, à partir de la base de données ESCAPAD 2017. Avant de mettre en place différents modèles de prédiction et de les comparer, nous allons commencer par analyser rapidement notre jeu de données et notre variable cible. 
+L'objectif de ce rapport est de prédire les déterminents de l'âge au premier alcool, à partir de la base de données ESCAPAD 2017. Avant de mettre en place différents modèles de prédiction et de les comparer, nous allons commencer par analyser rapidement notre jeu de données et notre variable cible.
 
 # Chargement des données
 ```{python}
-# %%
 import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.colors import LinearSegmentedColormap
 
 # Permet d'importer le package data depuis le dossier du projet
 ROOT = Path.cwd() if (Path.cwd() / "data").is_dir() else Path.cwd().parent
@@ -28,10 +27,27 @@ ROOT = Path.cwd() if (Path.cwd() / "data").is_dir() else Path.cwd().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from data import load_escap_data, preprocess
-from data.features import FEATURES, make_preprocessor
-from data.labels import TARGET, VARIABLES, WEIGHT
-from data.preprocess import TARGET_CLASS
+from data import load_escap_data
+from data.labels import (
+    ALCOOL_PARENT,
+    NON_CONCERNE,
+    NON_REPONDU,
+    PREDICTORS,
+    TARGET,
+    VARIABLES,
+    WEIGHT,
+)
+from data.preprocess import (
+    AGE_MAX,
+    SITUATION,
+    SITUATION_VARS,
+    TARGET_CLASS,
+    build_situation,
+    clean_target,
+    discretize_target,
+    encode_missing,
+    target_thresholds,
+)
 
 pd.set_option("display.width", 200)
 pd.set_option("display.max_columns", 50)
@@ -68,100 +84,14 @@ plt.rcParams.update(
     }
 )
 
-# Chargement des données
-df = preprocess(load_escap_data())
+# Chargement des données brutes (les étapes de prétraitement sont appliquées
+# au fil du rapport)
+df = load_escap_data()
+y = df[TARGET]
+w = df[WEIGHT]
+obs = y.notna()
 
-TARGET = "Q19A"
-WEIGHT = "pm17B"
-
-# Libellés des variables et des modalités (d'après le sujet).
-VARIABLES = {
-    "Q03": ("Sexe", {1: "Homme", 2: "Femme"}),
-    "Q04": ("Situation", {1: "Études", 2: "Études arrêtées"}),
-    "Q04A": (
-        "Situation scolaire",
-        {1: "Lycée / collège", 2: "Apprentissage", 3: "Supérieur"},
-    ),
-    "Q04B": (
-        "Situation professionnelle",
-        {1: "Sans activité", 2: "Recherche emploi", 3: "Insertion", 4: "Travaille"},
-    ),
-    "Q05": ("Redoublement", {1: "Non", 2: "Oui"}),
-    "Q06A": ("Difficultés pour lire", {1: "Non", 2: "Parfois", 3: "Souvent"}),
-    "Q06B": ("Difficultés pour écrire", {1: "Non", 2: "Parfois", 3: "Souvent"}),
-    "Q08": (
-        "Lieu de vie",
-        {
-            1: "Chez parent(s)",
-            2: "Internat",
-            3: "Foyer / fam. accueil",
-            4: "Propre logement",
-            5: "Autre",
-        },
-    ),
-    "Q08C": (
-        "Vie des parents",
-        {
-            1: "Ensemble",
-            2: "Séparés",
-            3: "Jamais connus",
-            4: "Décès",
-            5: "Autre",
-        },
-    ),
-    "Q09A1": (
-        "Situation du père",
-        {
-            1: "Travaille",
-            2: "Chômeur",
-            3: "Au foyer",
-            4: "Invalidité",
-            5: "Retraité",
-            6: "Ne sait pas",
-            7: "Non concerné",
-        },
-    ),
-    "Q09B1": (
-        "Situation de la mère",
-        {
-            1: "Travaille",
-            2: "Chômeuse",
-            3: "Au foyer",
-            4: "Invalidité",
-            5: "Retraitée",
-            6: "Ne sait pas",
-            7: "Non concernée",
-        },
-    ),
-    "Q10A1": ("PCS du père", None),
-    "Q10B1": ("PCS de la mère", None),
-    "B08A": ("Père boit à la maison", None),
-    "B08B": ("Mère boit à la maison", None),
-}
-PCS = {
-    1: "Agriculteur",
-    2: "Artisan, commerçant",
-    3: "Chef entr. ≥ 10 sal.",
-    4: "Cadre, prof. sup.",
-    5: "Prof. intermédiaire",
-    6: "Employé",
-    7: "Ouvrier",
-    8: "Sans profession",
-    9: "Non concerné",
-}
-ALCOOL_PARENT = {
-    1: "Jamais",
-    2: "Peu / an",
-    3: "1-2 / mois",
-    4: "≥ 1 / semaine",
-    5: "Presque chaque jour",
-}
-for var in ("Q10A1", "Q10B1"):
-    VARIABLES[var] = (VARIABLES[var][0], PCS)
-for var in ("B08A", "B08B"):
-    VARIABLES[var] = (VARIABLES[var][0], ALCOOL_PARENT)
-
-PREDICTORS = list(VARIABLES)
+AGE_MIN = 6  # âges plus jeunes jugés douteux
 MISSING_LABEL = "Non renseigné"
 
 
@@ -173,19 +103,32 @@ def as_labels(var: str) -> pd.Series:
     return pd.Categorical(values, categories=order, ordered=True)
 
 
+def weighted_share(values: pd.Series, weights: pd.Series) -> pd.Series:
+    """Part pondérée (%) de chaque modalité."""
+    s = weights.groupby(values, observed=False).sum()
+    return s / s.sum() * 100
+
+
+def summary(values: pd.Series, weights: pd.Series) -> pd.DataFrame:
+    """Effectif et part pondérée de chaque modalité."""
+    return pd.DataFrame(
+        {"effectif": values.value_counts(sort=False), "% pondéré": weighted_share(values, weights)}
+    ).round(1)
+
+
 df.head()
 ```
 
 ## Analyse des données
 
-L'enquête ESCAPAD (Enquête sur la Santé et les Consommations au cours de l'Appel de Préparation à la Défense) est une étude statistique française qui mesure les consommations de substances psychoactives et la santé des jeunes. Les données sont collectées lors de la JDC (Journée Défense et Citoyenneté) réalisée par des jeunes entre 16 et 25 ans. Le questionnaire porte sur les usages de produits addictifs légaux et illégaux (tabac, alcool, cannabis, médicaments psychotropes, ecstasy, cocaïne, etc.), leur contexte de consommation et l'état de santé global des jeunes (sommeil, santé mentale, écrans...). 
+L'enquête ESCAPAD (Enquête sur la Santé et les Consommations au cours de l'Appel de Préparation à la Défense) est une étude statistique française qui mesure les consommations de substances psychoactives et la santé des jeunes. Les données sont collectées lors de la JDC (Journée Défense et Citoyenneté) réalisée par des jeunes entre 16 et 25 ans. Le questionnaire porte sur les usages de produits addictifs légaux et illégaux (tabac, alcool, cannabis, médicaments psychotropes, ecstasy, cocaïne, etc.), leur contexte de consommation et l'état de santé global des jeunes (sommeil, santé mentale, écrans...).
 
-Le jeu de données dont nous disposons porte uniquement sur la consommation de boissons alcollisées. 
+Le jeu de données dont nous disposons porte uniquement sur la consommation de boissons alcollisées.
 
 
 ### La gestion des valeurs manquantes
 
-Notre jeu de données contient un certain nombre de valeur manquantes (présentées ci-dessous) qu'il est important de traiter. 
+Notre jeu de données contient un certain nombre de valeur manquantes (présentées ci-dessous) qu'il est important de traiter.
 
 ```{python}
 na_rate = df.drop(columns=["A01", WEIGHT]).isna().mean().sort_values() * 100
@@ -207,23 +150,14 @@ plt.tight_layout()
 plt.show()
 ```
 
-Les variables qui nous préoccupent principalement sont la Q04B car elle comporte un très grand nombre de valeurs manquantes (96%) et la Q19A car il s'agit de notre variable cible (18% de NA). 
+Les variables qui nous préoccupent principalement sont la Q04B car elle comporte un très grand nombre de valeurs manquantes (96%) et la Q19A car il s'agit de notre variable cible (18% de NA).
 
-Pour notre variable cible on peut considérer que les 18% de jeunes qui ne renseignent pas leur âge de première consommation ne sont tout simplement pas concernés par la question. Il s'agirait donc de jeunes qui n'ont jamais bu d'alcool. Les NA ici seront donc recodés en une nouvelle modalité : pas concerné. 
+Pour notre variable cible on peut considérer que les 18% de jeunes qui ne renseignent pas leur âge de première consommation ne sont tout simplement pas concernés par la question. Il s'agirait donc de jeunes qui n'ont jamais bu d'alcool. Les NA ici seront donc recodés en une nouvelle modalité : pas concerné.
 
-Les variables Q04A "Situation scolaire" et Q04B "Situation professionnelle" présentent un fort taux de non réponse car il s'agit de variables dépendantes. Elles dépendent de la réponse à la question Q04 "Situation". Nous allons donc pouvoir utiliser cette dépendance pour gérer les non réponses. 
+Les variables Q04A "Situation scolaire" et Q04B "Situation professionnelle" présentent un fort taux de non réponse car il s'agit de variables dépendantes. Elles dépendent de la réponse à la question Q04 "Situation". Nous allons donc pouvoir utiliser cette dépendance pour gérer les non réponses.
 L'idée est la suivante : Q04A n'est posée qu'à ceux qui suivent des études (Q04 = 1) et Q04B qu'à ceux qui les ont arrêtées (Q04 = 2). Si Q04 manque et qu'une seule des deux est renseignée, on en déduit Q04. Si les deux sont renseignées, on ne peut pas trancher et Q04 reste non répondu.
 
 ```{python}
-# %%
-from data.preprocess import (  # noqa: E402
-    build_situation
-)
-
-# Variables décrivant la situation de consommation
-SITUATION_VARS = ["Q04", "Q04A", "Q04B"]
-
-
 patterns = (
     df[list(SITUATION_VARS)]
     .notna()
@@ -237,17 +171,19 @@ patterns
 
 
 ```{python}
-# %%
-df2 = build_situation(df)
+# Nettoyage et discrétisation de la cible (détaillés plus bas), puis situation
+df1 = discretize_target(clean_target(df))
+df2 = build_situation(df1)
 pd.crosstab(df2["Q04"], df2["Q04A"], margins=True, margins_name="Total")
-# %%
+```
+
+```{python}
 pd.crosstab(df2["Q04"], df2["Q04B"], margins=True, margins_name="Total")
 ```
 
-On obtient au final la variable `Situation` suivante : 
+On obtient au final la variable `Situation` suivante :
 
 ```{python}
-# %%
 stats_sit = summary(df2[SITUATION], df2[WEIGHT])
 stats_sit["% jamais bu"] = (
     df2.assign(nb=df2[TARGET_CLASS].eq(NON_CONCERNE) * df2[WEIGHT])
@@ -267,7 +203,6 @@ stats_sit
 ```
 
 ```{python}
-# %%
 fig, ax = plt.subplots(figsize=(8, 4))
 colors = [GREY if NON_REPONDU in m else (BLUE if m.startswith("Études") else ORANGE)
           for m in stats_sit.index]
@@ -282,10 +217,9 @@ plt.tight_layout()
 plt.show()
 ```
 
-Pour les autres prédicteurs les NA seront ajouté à une nouvelle modalioté "Non répondu" car le nombre de non réponse est faible voire très faible. 
+Pour les autres prédicteurs les NA seront ajouté à une nouvelle modalioté "Non répondu" car le nombre de non réponse est faible voire très faible.
 
 ```{python}
-# %%
 others = [v for v in PREDICTORS if v not in SITUATION_VARS]
 df3 = encode_missing(df2, others)
 
@@ -302,10 +236,15 @@ na_table.sort_values("Non répondu (effectif)", ascending=False)
 
 ### L'âge au premier alcool
 
-Les appelés ont entre 16 et 25 ans. Un âge au premier alcool supérieur à 25 ans est donc incohérent, et les très jeunes âges (≤ 5 ans) sont douteux. On décide donc de signaler les jeunes âges sans les supprimer et de supprimer les valeurs au dessus de 25 ans. 
+Les appelés ont entre 16 et 25 ans. Un âge au premier alcool supérieur à 25 ans est donc incohérent, et les très jeunes âges (≤ 5 ans) sont douteux. On décide donc de signaler les jeunes âges sans les supprimer et de supprimer les valeurs au dessus de 25 ans.
 
 ```{python}
-# %%
+removed = df.loc[~df.index.isin(df1.index), TARGET]
+print(f"{len(removed)} individus supprimés (Q19A > {AGE_MAX}) : {removed.tolist()}")
+print(f"Reste : {len(df1)} individus")
+```
+
+```{python}
 def weighted_quantile(values, weights, q):
     order = np.argsort(values)
     v, cw = np.asarray(values)[order], np.cumsum(np.asarray(weights)[order])
@@ -329,8 +268,8 @@ def weighted_box_stats(values, weights):
     }
 
 
-obs = df1[TARGET].notna()
-ages, w_ages = df1.loc[obs, TARGET], df1.loc[obs, WEIGHT]
+obs1 = df1[TARGET].notna()
+ages, w_ages = df1.loc[obs1, TARGET], df1.loc[obs1, WEIGHT]
 thresholds = target_thresholds(df1)
 box = weighted_box_stats(ages, w_ages)
 
@@ -371,6 +310,7 @@ plt.show()
 pd.Series(
     {
         "Effectif (déjà bu)": len(ages),
+        "Moyenne non pondérée": ages.mean(),
         "Moyenne": box["mean"],
         "Écart-type": np.sqrt(np.average((ages - box["mean"]) ** 2, weights=w_ages)),
         "Min": ages.min(),
@@ -384,41 +324,43 @@ pd.Series(
 ).to_frame("Q19A")
 ```
 
-
-```{python}
-# %%
-def weighted_quantile(values, weights, q):
-    order = np.argsort(values)
-    v, cw = np.asarray(values)[order], np.cumsum(np.asarray(weights)[order])
-    return v[np.searchsorted(cw, q * cw[-1])]
-
-
-y_obs, w_obs = y[obs], w[obs]
-pd.Series(
-    {
-        "Moyenne non pondérée": y_obs.mean(),
-        "Moyenne pondérée": wmean,
-        "Écart-type pondéré": np.sqrt(np.average((y_obs - wmean) ** 2, weights=w_obs)),
-        "Q1 pondéré": weighted_quantile(y_obs, w_obs, 0.25),
-        "Médiane pondérée": weighted_quantile(y_obs, w_obs, 0.5),
-        "Q3 pondéré": weighted_quantile(y_obs, w_obs, 0.75),
-    }
-).round(2).to_frame("Q19A")
-```
-
-```{python}
-# %%
-df1 = clean_target(raw)
-removed = raw.loc[~raw.index.isin(df1.index), TARGET]
-print(f"{len(removed)} individus supprimés (Q19A > {AGE_MAX}) : {removed.tolist()}")
-print(f"Reste : {len(df1)} individus")
-```
-
-On observe une moyenne d'âge de première consommation d'alcool autour de 14 ans et une médiane autour de 15 ans. Avec une large majorité (70%) des répondants qui déclare une première consommation entre 14 et 16 ans. 
+On observe une moyenne d'âge de première consommation d'alcool autour de 14 ans et une médiane autour de 15 ans. Avec une large majorité (70%) des répondants qui déclare une première consommation entre 14 et 16 ans.
 
 ### Discrétisation de l'âge au premier alcool
 
+L'âge étant entier et très concentré, les quartiles tombent sur des valeurs répétées : pour chaque quartile, on retient l'âge dont la fonction de répartition pondérée est la plus proche, ce qui donne des classes de taille proche. Les NA deviennent « Non concerné » (jamais bu).
+
 ```{python}
+print(f"Seuils retenus : {thresholds}")
+
+stats_class = summary(df1[TARGET_CLASS], df1[WEIGHT])
+stats_class["% pondéré parmi buveurs"] = (
+    weighted_share(df1.loc[obs1, TARGET_CLASS], df1.loc[obs1, WEIGHT])
+    .drop(NON_CONCERNE)
+    .round(1)
+)
+stats_class["âge moyen"] = (
+    df1[obs1]
+    .groupby(TARGET_CLASS, observed=False)[[TARGET, WEIGHT]]
+    .apply(lambda g: np.average(g[TARGET], weights=g[WEIGHT]) if len(g) else np.nan)
+    .round(2)
+)
+stats_class
+```
+
+```{python}
+shares = weighted_share(df1[TARGET_CLASS], df1[WEIGHT])
+fig, ax = plt.subplots(figsize=(8, 3.2))
+bars = ax.barh(shares.index.astype(str), shares.values,
+               color=BLUE_RAMP[: len(shares) - 1] + [GREY], height=0.7)
+ax.bar_label(bars, fmt="%.1f %%", padding=3, fontsize=8, color=TEXT)
+ax.invert_yaxis()
+ax.set_xlim(0, shares.max() * 1.2)
+ax.set_xlabel("Part (%, pondéré)")
+ax.set_title("Classes d'âge au premier alcool (Q19A_CLASSE)")
+ax.grid(axis="y", visible=False)
+plt.tight_layout()
+plt.show()
 ```
 
 ### Les prédicteurs potentiels
@@ -426,7 +368,6 @@ On observe une moyenne d'âge de première consommation d'alcool autour de 14 an
 Pour chacun des prédicteurs on observe ici les parts pondérées de chaque modalité, les non-réponses forment une modalité à part (en gris).
 
 ```{python}
-# %%
 def weighted_shares(var: str) -> pd.Series:
     s = pd.DataFrame({"mod": as_labels(var), "w": w}).groupby("mod", observed=False)["w"].sum()
     return s / s.sum() * 100
@@ -456,7 +397,6 @@ Nous avons ensuite observé le lien entre l'âge au premier alcool et chaque pr�
 
 
 ```{python}
-# %%
 clean = obs & (y >= AGE_MIN) & (y <= AGE_MAX)
 mean_clean = np.average(y[clean], weights=w[clean])
 
@@ -500,15 +440,40 @@ plt.tight_layout(rect=(0, 0, 1, 0.97))
 plt.show()
 ```
 
-On observe notamment que `la consommation d'alcool des parents` semble avoir un effet important sur l'âge de la première consommation des enfants. En effet, plus la mère ou le père consomment régulièrement, plus l'enfant a tendance à consommer tôt. Cette hypothèse semble confirmée lorsque l'on croise les habitudes de consommations du père et de la mère et qu'on observe l'âge moyen de première consommation des enfants. Dans le graphique suivant les cases de moins de 30 répondants sont masquées. 
+On observe notamment que `la consommation d'alcool des parents` semble avoir un effet important sur l'âge de la première consommation des enfants. En effet, plus la mère ou le père consomment régulièrement, plus l'enfant a tendance à consommer tôt. Cette hypothèse semble confirmée lorsque l'on croise les habitudes de consommations du père et de la mère et qu'on observe l'âge moyen de première consommation des enfants. Dans le graphique suivant les cases de moins de 30 répondants sont masquées.
 
 ```{python}
+m = clean & df["B08A"].notna() & df["B08B"].notna()
+grid = pd.DataFrame({"pere": df["B08A"], "mere": df["B08B"], "y": y, "w": w})[m]
+grid["yw"] = grid["y"] * grid["w"]
+agg = grid.groupby(["pere", "mere"]).agg(yw=("yw", "sum"), w=("w", "sum"), n=("y", "size"))
+heat = (agg["yw"] / agg["w"]).where(agg["n"] >= 30).unstack()
+counts = agg["n"].unstack()
+
+fig, ax = plt.subplots(figsize=(7, 5.5))
+cmap = LinearSegmentedColormap.from_list("blue_ramp", BLUE_RAMP[::-1])  # foncé = précoce
+im = ax.imshow(heat.values, cmap=cmap, aspect="auto")
+for i in range(heat.shape[0]):
+    for j in range(heat.shape[1]):
+        v = heat.values[i, j]
+        if not np.isnan(v):
+            ax.text(j, i, f"{v:.1f}\n(n={counts.values[i, j]})", ha="center", va="center",
+                    fontsize=7, color="white" if v < heat.stack().median() else "#0b0b0b")
+labels = list(ALCOOL_PARENT.values())
+ax.set_xticks(range(5), labels, rotation=30, ha="right")
+ax.set_yticks(range(5), labels)
+ax.set_xlabel("La mère boit à la maison (B08B)")
+ax.set_ylabel("Le père boit à la maison (B08A)")
+ax.set_title("Âge moyen au premier alcool selon la consommation des parents")
+ax.grid(False)
+fig.colorbar(im, ax=ax, label="Âge moyen (ans)", shrink=0.8)
+plt.tight_layout()
+plt.show()
 ```
 
 Nous avons également observé la distribution de `l'âge de première consommation selon le sexe`. Si la majorité des filles comme des garçons consomment le premier verre d'alcool entre 14 et 16 ans on remarque que les garçons sont plus nombreux à consommer plus jeunes.
 
 ```{python}
-# %%
 fig, ax = plt.subplots(figsize=(8, 4))
 for code, color in ((1, BLUE), (2, ORANGE)):
     m = clean & (df["Q03"] == code)
@@ -524,8 +489,3 @@ ax.legend()
 plt.tight_layout()
 plt.show()
 ```
-
-
-
-
-Path("stat_desc.qmd").write_text(contenu, encoding="utf-8")

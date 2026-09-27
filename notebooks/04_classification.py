@@ -559,7 +559,7 @@ plt.show()
 #   itérations, pas de 0,02) et les mêmes scores (log-loss 1,235, AUC 0,649),
 #   en 5 fois moins de temps.
 # - **Ridge, lasso, elastic net** : scores identiques (log-loss 1,247-1,248,
-#   AUC 0,645-0,646). Le lasso (C = 0,1) ne garde que 41 coefficients sur 70 :
+#   AUC 0,645-0,646). Le lasso (C = 0,1) ne garde que 41 coefficients sur 67 :
 #   il écarte les indicatrices de non-réponse et une partie des modalités de
 #   `SITUATION`, du lieu de vie, de la vie, de la situation et de la PCS des
 #   parents, sans perte de performance. Ces modalités n'apportent donc rien de plus une fois
