@@ -511,3 +511,5 @@ print(f"Plage des prédictions : [{pred_best.min():.1f}, {pred_best.max():.1f}] 
 # - **Variables** : le sexe et la consommation d'alcool des parents dominent,
 #   puis les PCS des parents et le redoublement ; Ridge et le modèle
 #   d'agrégation s'accordent sur ce classement.
+
+# %%

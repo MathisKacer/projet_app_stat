@@ -335,3 +335,5 @@ print(f"Jeu prétraité : {df3.shape[0]} individus, {df3.shape[1]} colonnes")
 remaining_na = df3.isna().sum()
 print("NA restants :", remaining_na[remaining_na > 0].to_dict(), "(Q19A continue des non-buveurs)")
 df3.head()
+
+# %%
