@@ -1,0 +1,1173 @@
+---
+title: "L'âge au premier alcool"
+subtitle: "Analyse descriptive et modélisation à partir de l'enquête ESCAPAD 2017"
+author: "Kacer Mathis, Leal-Fernandes Marylou"
+lang: fr
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    include-in-header:
+      text: |
+        <style>
+        .cell-output-display { margin-top: 1.2rem; margin-bottom: 2.5rem; }
+        .cell-output-display table { font-size: 0.85rem; margin: 0.5rem auto 0; width: auto; }
+        .cell-output-display table th, .cell-output-display table td { padding: 0.3rem 0.8rem; }
+        .cell-output-display table thead th { text-align: center; }
+        .cell-output-display table tbody th { text-align: left; font-weight: 500; }
+        .cell-output-display table tbody td { text-align: right; }
+        figcaption, caption, .quarto-float-caption { font-weight: 600; margin-bottom: 0.6rem; }
+        </style>
+crossref:
+  tbl-title: "Tableau"
+  title-delim: " :"
+execute:
+  echo: false
+  warning: false
+jupyter: python3
+---
+
+```{python}
+#| include: false
+import sys
+import time
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from joblib import Parallel, delayed
+from matplotlib.colors import LinearSegmentedColormap
+from sklearn.base import clone
+from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import (
+    BaggingClassifier,
+    GradientBoostingClassifier,
+    HistGradientBoostingClassifier,
+    RandomForestClassifier,
+    StackingClassifier,
+)
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, log_loss, roc_auc_score
+from sklearn.model_selection import ParameterGrid, StratifiedKFold, train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import LabelEncoder
+from sklearn.tree import DecisionTreeClassifier
+from xgboost import XGBClassifier
+
+# Permet d'importer le package data depuis le dossier du projet
+ROOT = Path.cwd() if (Path.cwd() / "data").is_dir() else Path.cwd().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from data import load_escap_data, preprocess
+from data.features import FEATURES, make_preprocessor
+from data.labels import ALCOOL_PARENT, NON_CONCERNE, NON_REPONDU, TARGET, VARIABLES, WEIGHT
+from data.preprocess import (
+    AGE_MAX,
+    SITUATION,
+    SITUATION_VARS,
+    TARGET_CLASS,
+    build_situation,
+    clean_target,
+    discretize_target,
+)
+
+SEED = 42
+N_JOBS = -1
+
+# Palette : une couleur principale, une secondaire, des gris pour le reste.
+BLUE = "#2a78d6"
+ORANGE = "#eb6834"
+GREY = "#8a8985"
+TEXT = "#52514e"
+BLUE_RAMP = ["#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b"]
+CM_RAMP = ["#ffffff"] + BLUE_RAMP
+CLASS_COLORS = ["#86b6ef", "#3987e5", "#1c5cab", GREY]  # précoce, classique, tardif, jamais bu
+
+plt.rcParams.update(
+    {
+        "figure.dpi": 110,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.edgecolor": GREY,
+        "axes.labelcolor": TEXT,
+        "axes.titleweight": "bold",
+        "axes.titlesize": 11,
+        "axes.labelsize": 9,
+        "xtick.color": TEXT,
+        "ytick.color": TEXT,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "axes.grid": True,
+        "grid.color": "#e4e3df",
+        "grid.linewidth": 0.6,
+        "axes.axisbelow": True,
+        "legend.frameon": False,
+        "legend.fontsize": 8,
+    }
+)
+
+# Données brutes (les étapes de prétraitement sont appliquées au fil du rapport)
+df = load_escap_data()
+y = df[TARGET]
+w = df[WEIGHT]
+obs = y.notna()
+AGE_MIN = 6  # âges plus jeunes jugés douteux
+
+
+def var_label(var: str) -> str:
+    return f"{var} · {VARIABLES[var][0]}" if var in VARIABLES else f"{var} · Situation (synthèse)"
+
+
+def as_labels(var: str) -> pd.Series:
+    """Variable avec libellés, les non-réponses formant une modalité."""
+    _, labels = VARIABLES[var]
+    order = list(labels.values()) + [NON_REPONDU]
+    values = df[var].map(labels).fillna(NON_REPONDU)
+    return pd.Categorical(values, categories=order, ordered=True)
+
+
+def weighted_share(values: pd.Series, weights: pd.Series) -> pd.Series:
+    """Part pondérée (%) de chaque modalité."""
+    s = weights.groupby(values, observed=False).sum()
+    return s / s.sum() * 100
+
+
+def fr(x, digits=1) -> str:
+    """Nombre au format français (virgule décimale, espace des milliers)."""
+    if pd.isna(x):
+        return "sans objet"
+    return f"{x:,.{digits}f}".replace(",", " ").replace(".", ",")
+
+
+def pct(x, digits=1) -> str:
+    return "sans objet" if pd.isna(x) else fr(x, digits) + " %"
+```
+
+# Introduction
+
+L'objectif de ce rapport est de prédire l'âge au premier alcool à partir de la base de données ESCAPAD 2017. Nous commençons par une analyse descriptive du jeu de données : valeurs manquantes, distribution de l'âge au premier alcool, construction de la variable à prédire et liens avec les variables explicatives. Nous mettons ensuite en place et comparons différents modèles de classification, des plus simples aux méthodes d'agrégation (bagging, forêt aléatoire, boosting, stacking).
+
+# Analyse descriptive
+
+## Les données
+
+L'enquête ESCAPAD (Enquête sur la Santé et les Consommations lors de l'Appel de Préparation à la Défense) est une étude statistique française qui mesure les consommations de substances psychoactives et la santé des jeunes. Les données sont collectées lors de la JDC (Journée Défense et Citoyenneté), à laquelle participent des jeunes de 16 à 25 ans. Le questionnaire porte sur les usages de produits addictifs légaux et illégaux (tabac, alcool, cannabis, médicaments psychotropes, ecstasy, cocaïne, etc.), leur contexte de consommation et l'état de santé global des jeunes (sommeil, santé mentale, écrans...).
+
+Le jeu de données dont nous disposons porte uniquement sur la consommation de boissons alcoolisées. Il contient 13 314 jeunes et 18 variables : l'identifiant, le poids de sondage `pm17B`, l'âge au premier alcool `Q19A` (notre cible) et 15 variables décrivant le jeune et son contexte familial. Toutes les statistiques de ce rapport sont pondérées par `pm17B`, sauf mention contraire.
+
+## La gestion des valeurs manquantes
+
+Notre jeu de données contient un certain nombre de valeurs manquantes (présentées ci-dessous) qu'il est important de traiter.
+
+```{python}
+na_rate = df.drop(columns=["A01", WEIGHT]).isna().mean().sort_values() * 100
+
+fig, ax = plt.subplots(figsize=(7, 4.5))
+colors = [ORANGE if v == TARGET else BLUE for v in na_rate.index]
+bars = ax.barh(
+    [var_label(v) if v != TARGET else f"{v} · Âge au premier alcool (cible)" for v in na_rate.index],
+    na_rate.values,
+    color=colors,
+    height=0.7,
+)
+ax.bar_label(bars, fmt="%.1f %%", padding=3, fontsize=7, color=TEXT)
+ax.set_xlabel("Part de valeurs manquantes (%, non pondéré)")
+ax.set_title("Valeurs manquantes par variable")
+ax.grid(axis="y", visible=False)
+ax.set_xlim(0, 105)
+plt.tight_layout()
+plt.show()
+```
+
+Les variables qui nous préoccupent principalement sont `Q04B`, car elle comporte un très grand nombre de valeurs manquantes (96 %), et `Q19A`, car il s'agit de notre variable cible (18 % de valeurs manquantes).
+
+Pour notre variable cible, on peut considérer que les 18 % de jeunes qui ne renseignent pas leur âge de première consommation ne sont tout simplement pas concernés par la question : il s'agirait de jeunes qui n'ont jamais bu d'alcool. Ces valeurs manquantes sont donc recodées en une nouvelle modalité « Non concerné ».
+
+Les variables `Q04A` « Situation scolaire » et `Q04B` « Situation professionnelle » présentent un fort taux de non-réponse car ce sont des questions filtrées : elles dépendent de la réponse à la question `Q04` « Situation ». `Q04A` n'est posée qu'à ceux qui suivent des études (`Q04` = 1) et `Q04B` qu'à ceux qui les ont arrêtées (`Q04` = 2). Le tableau suivant donne les combinaisons de réponses à ces trois questions.
+
+```{python}
+#| label: tbl-q04
+#| tbl-cap: "Combinaisons de réponses aux trois questions de situation"
+patterns = (
+    df[list(SITUATION_VARS)]
+    .notna()
+    .value_counts()
+    .rename("Effectif")
+    .reset_index()
+    .replace({True: "renseignée", False: "manquante"})
+    .rename(columns={v: var_label(v) for v in SITUATION_VARS})
+)
+patterns["Effectif"] = patterns["Effectif"].map(lambda n: fr(n, 0))
+patterns.set_index(var_label("Q04"))
+```
+
+Nous utilisons cette dépendance pour gérer les non-réponses. Si `Q04` manque et qu'une seule des deux questions filtrées est renseignée, on en déduit `Q04`. Si les deux sont renseignées, on ne peut pas trancher et la situation reste non répondue. Nous résumons ensuite les trois questions en une seule variable `SITUATION`, qui croise la situation (études ou arrêt) et le type d'études ou d'activité.
+
+```{python}
+df1 = discretize_target(clean_target(df))
+df2 = build_situation(df1)
+stats_sit = pd.DataFrame(
+    {
+        "Effectif": df2[SITUATION].value_counts(sort=False),
+        "Part pondérée": weighted_share(df2[SITUATION], df2[WEIGHT]),
+        "Jamais bu": (
+            df2.assign(nb=df2[TARGET_CLASS].eq(NON_CONCERNE) * df2[WEIGHT])
+            .groupby(SITUATION, observed=False)[["nb", WEIGHT]]
+            .sum()
+            .pipe(lambda g: g["nb"] / g[WEIGHT] * 100)
+        ),
+        "Âge moyen au 1er alcool": (
+            df2[df2[TARGET].notna()]
+            .groupby(SITUATION, observed=False)[[TARGET, WEIGHT]]
+            .apply(lambda g: np.average(g[TARGET], weights=g[WEIGHT]) if len(g) else np.nan)
+        ),
+    }
+)
+
+fig, ax = plt.subplots(figsize=(8, 3.8))
+colors = [GREY if NON_REPONDU in m else (BLUE if m.startswith("Études") else ORANGE)
+          for m in stats_sit.index]
+bars = ax.barh(stats_sit.index.astype(str), stats_sit["Part pondérée"], color=colors, height=0.7)
+ax.bar_label(bars, fmt="%.1f", padding=3, fontsize=8, color=TEXT)
+ax.invert_yaxis()
+ax.set_xscale("log")
+ax.set_xlabel("Part (%, pondéré, échelle log)")
+ax.set_title("Variable SITUATION")
+ax.grid(axis="y", visible=False)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: tbl-situation
+#| tbl-cap: "La variable de synthèse SITUATION"
+pd.DataFrame(
+    {
+        "Effectif": stats_sit["Effectif"].map(lambda n: fr(n, 0)),
+        "Part (%, pondéré)": stats_sit["Part pondérée"].map(pct),
+        "N'a jamais bu (%)": stats_sit["Jamais bu"].map(pct),
+        "Âge moyen au 1er alcool (ans)": stats_sit["Âge moyen au 1er alcool"].map(lambda x: fr(x, 2)),
+    }
+).rename_axis("Situation")
+```
+
+La grande majorité des jeunes (87 %) sont au lycée ou au collège, et 7 % sont en apprentissage. Les jeunes qui ont arrêté leurs études sont peu nombreux (environ 4 %). Les apprentis ont plus souvent déjà bu que les lycéens (12 % n'ont jamais bu, contre 19 %). Les jeunes dont la situation n'est pas renseignée n'ont souvent jamais bu, mais ils sont trop peu nombreux pour en tirer une conclusion.
+
+Pour les autres variables explicatives, plutôt que de les remplacer par une valeur (imputation), nous les regroupons dans une modalité à part, « Non répondu », pour toutes les variables, y compris les variables ordinales comme la consommation d'alcool des parents. Cela évite de faire une hypothèse sur la réponse manquante, et permet aux modèles d'utiliser la non-réponse comme une information. Les non-réponses les plus fréquentes concernent la PCS des parents (environ 12 %) et la consommation d'alcool du père et de la mère (10 % et 8 %), puis la situation du père (3 %) et de la mère (2 %). Pour les autres variables, elles concernent moins de 1 % des jeunes.
+
+## L'âge au premier alcool
+
+Les appelés ont entre 16 et 25 ans. Un âge au premier alcool supérieur à 25 ans est donc incohérent, et les très jeunes âges (≤ 5 ans) sont douteux. Nous avons décidé de conserver les jeunes âges en les signalant, et de supprimer les valeurs au-dessus de 25 ans : cela concerne 3 jeunes (26, 26 et 32 ans), il en reste donc 13 311.
+
+```{python}
+def weighted_quantile(values, weights, q):
+    order = np.argsort(values)
+    v, cw = np.asarray(values)[order], np.cumsum(np.asarray(weights)[order])
+    return v[np.searchsorted(cw, np.asarray(q) * cw[-1])]
+
+
+def weighted_box_stats(values, weights):
+    """Statistiques d'une boîte à moustaches pondérée (format `Axes.bxp`)."""
+    values, weights = np.asarray(values), np.asarray(weights)
+    q1, med, q3 = weighted_quantile(values, weights, [0.25, 0.5, 0.75])
+    iqr = q3 - q1
+    inside = values[(values >= q1 - 1.5 * iqr) & (values <= q3 + 1.5 * iqr)]
+    return {
+        "med": med,
+        "q1": q1,
+        "q3": q3,
+        "whislo": inside.min(),
+        "whishi": inside.max(),
+        "mean": np.average(values, weights=weights),
+        "fliers": np.unique(values[(values < inside.min()) | (values > inside.max())]),
+    }
+
+
+obs1 = df1[TARGET].notna()
+ages, w_ages = df1.loc[obs1, TARGET], df1.loc[obs1, WEIGHT]
+box = weighted_box_stats(ages, w_ages)
+dist = weighted_share(ages, w_ages)
+
+fig, (ax_box, ax_hist) = plt.subplots(
+    2, 1, figsize=(8.5, 4.5), sharex=True, gridspec_kw={"height_ratios": [1, 4]}
+)
+ax_box.bxp(
+    [box],
+    orientation="horizontal",
+    showmeans=True,
+    widths=0.6,
+    patch_artist=True,
+    boxprops={"facecolor": "#cde2fb", "edgecolor": BLUE},
+    medianprops={"color": BLUE, "linewidth": 2},
+    whiskerprops={"color": BLUE},
+    capprops={"color": BLUE},
+    meanprops={"marker": "D", "markerfacecolor": ORANGE, "markeredgecolor": "white"},
+    flierprops={"marker": "o", "markersize": 4, "markerfacecolor": GREY, "markeredgecolor": GREY},
+)
+ax_box.set_yticks([])
+ax_box.spines["left"].set_visible(False)
+ax_box.grid(False)
+ax_box.set_title("Âge au premier alcool (jeunes ayant déjà bu, pondéré)")
+
+ax_hist.bar(dist.index, dist.values, color=BLUE, width=0.8)
+ax_hist.set_xticks(dist.index.astype(int))
+ax_hist.set_xlabel("Âge au premier alcool (ans)")
+ax_hist.set_ylabel("Part (%, pondéré)")
+ax_hist.grid(axis="x", visible=False)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: tbl-age
+#| tbl-cap: "Statistiques de l'âge au premier alcool (jeunes ayant déjà bu)"
+sd_age = np.sqrt(np.average((ages - box["mean"]) ** 2, weights=w_ages))
+outside = (~ages.between(box["whislo"], box["whishi"])).sum()
+pd.Series(
+    {
+        "Effectif (jeunes ayant déjà bu)": fr(len(ages), 0),
+        "Moyenne non pondérée": fr(ages.mean(), 2) + " ans",
+        "Moyenne pondérée": fr(box["mean"], 2) + " ans",
+        "Écart-type pondéré": fr(sd_age, 2) + " ans",
+        "Minimum": fr(ages.min(), 0) + " ans",
+        "Premier quartile": fr(box["q1"], 0) + " ans",
+        "Médiane": fr(box["med"], 0) + " ans",
+        "Troisième quartile": fr(box["q3"], 0) + " ans",
+        "Maximum": fr(ages.max(), 0) + " ans",
+        "Limites des moustaches": f"{box['whislo']:.0f} à {box['whishi']:.0f} ans",
+        "Valeurs hors moustaches": f"{outside} jeunes",
+    }
+).to_frame("Valeur").rename_axis("Statistique")
+```
+
+On observe une moyenne d'âge de première consommation d'alcool autour de 14 ans et une médiane de 15 ans, avec une large majorité (70 %) des répondants qui déclarent une première consommation entre 14 et 16 ans. La distribution est très concentrée et étirée vers les jeunes âges.
+
+## La variable à prédire
+
+### Découpage de l'âge en classes
+
+Nous avons choisi de prédire une version discrétisée de l'âge au premier alcool, en gardant tous les jeunes, y compris ceux qui n'ont jamais bu. Un découpage naturel consiste à utiliser les quartiles de l'âge : comme l'âge est entier et très concentré, les quartiles tombent sur 13, 14 et 15 ans, ce qui donne quatre classes d'âge. En y ajoutant les jeunes qui n'ont jamais bu, on obtient **cinq classes** :
+
+```{python}
+#| label: tbl-quartiles
+#| tbl-cap: "Classes obtenues avec un découpage par quartiles"
+q_classes = df1[TARGET_CLASS]
+pd.DataFrame(
+    {
+        "Effectif": q_classes.value_counts(sort=False).map(lambda n: fr(n, 0)),
+        "Part (%, pondéré)": weighted_share(q_classes, df1[WEIGHT]).map(pct),
+    }
+).rename_axis("Classe")
+```
+
+Les classes « 14 ans » et « 15 ans » décrivent cependant des profils très proches, et lors de premiers essais, les modèles ne parvenaient pas à les distinguer : ils leur attribuaient les mêmes probabilités et ne prédisaient jamais la classe « 14 ans ». Nous préférons donc **regrouper 14 et 15 ans**, pour obtenir trois profils de consommation faciles à interpréter, plus les jeunes qui n'ont jamais bu :
+
+- **précoce** : premier verre à 13 ans ou avant,
+- **classique** : premier verre à 14 ou 15 ans,
+- **tardif** : premier verre à 16 ans ou après,
+- **jamais bu** : la classe « Non concerné ».
+
+```{python}
+df_clf = preprocess(load_escap_data(), thresholds=[13, 15])
+CLASSES = list(df_clf[TARGET_CLASS].cat.categories)
+PROFILS = dict(zip(CLASSES, ["précoce", "classique", "tardif", "jamais bu"]))
+
+drinkers = df_clf[TARGET].notna()
+ages_c, w_c = df_clf.loc[drinkers, TARGET], df_clf.loc[drinkers, WEIGHT]
+dist_c = weighted_share(ages_c, w_c)
+class_idx = np.searchsorted([13, 15], dist_c.index, side="left")
+
+fig, ax = plt.subplots(figsize=(8.5, 3.8))
+ax.bar(dist_c.index, dist_c.values, color=[CLASS_COLORS[i] for i in class_idx], width=0.8)
+for t in (13, 15):
+    ax.axvline(t + 0.5, color=TEXT, linestyle=":", linewidth=1)
+for i, x in enumerate((10.5, 14.5, 18)):
+    ax.annotate(f"{CLASSES[i]}\n({list(PROFILS.values())[i]})", (x, dist_c.max() * 1.08),
+                ha="center", fontsize=8, color=TEXT, fontweight="bold")
+ax.set_xticks(dist_c.index.astype(int))
+ax.set_xlabel("Âge au premier alcool (ans)")
+ax.set_ylabel("Part des jeunes ayant déjà bu (%, pondéré)")
+ax.set_title("Découpage retenu : précoces, classiques et tardifs")
+ax.set_ylim(0, dist_c.max() * 1.3)
+ax.grid(axis="x", visible=False)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: tbl-classes
+#| tbl-cap: "Classes retenues pour la variable à prédire"
+yc, wc = df_clf[TARGET_CLASS].astype(str), df_clf[WEIGHT]
+age_moyen = (
+    df_clf[drinkers]
+    .groupby(TARGET_CLASS, observed=False)[[TARGET, WEIGHT]]
+    .apply(lambda g: np.average(g[TARGET], weights=g[WEIGHT]) if len(g) else np.nan)
+)
+pd.DataFrame(
+    {
+        "Profil": [PROFILS[c] for c in CLASSES],
+        "Effectif": yc.value_counts().reindex(CLASSES).map(lambda n: fr(n, 0)),
+        "Part (%, pondéré)": (wc.groupby(yc).sum().reindex(CLASSES) / wc.sum() * 100).map(pct),
+        "Âge moyen au 1er alcool (ans)": age_moyen.reindex(CLASSES).map(lambda x: fr(x, 1)),
+    },
+    index=CLASSES,
+).rename_axis("Classe")
+```
+
+La classe classique regroupe 40,5 % des jeunes. Les trois autres classes ont des tailles proches : 19,1 % de précoces, 22,1 % de tardifs et 18,3 % de jeunes n'ayant jamais bu. Un modèle qui prédirait toujours la classe « 14-15 ans » aurait donc déjà une accuracy d'environ 40 %.
+
+## Les prédicteurs potentiels
+
+Pour chacun des prédicteurs, on observe ici les parts pondérées de chaque modalité. Les non-réponses forment une modalité à part (en gris). Nous avons séparé les variables qui décrivent le jeune de celles qui décrivent sa famille.
+
+```{python}
+JEUNE = ["Q03", "Q04", "Q04A", "Q04B", "Q05", "Q06A", "Q06B", "Q08"]
+FAMILLE = ["Q08C", "Q09A1", "Q09B1", "Q10A1", "Q10B1", "B08A", "B08B"]
+
+
+def weighted_shares(var: str) -> pd.Series:
+    s = pd.DataFrame({"mod": as_labels(var), "w": w}).groupby("mod", observed=False)["w"].sum()
+    return s / s.sum() * 100
+
+
+def plot_shares(variables, title):
+    ncols = 3
+    nrows = int(np.ceil(len(variables) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(11, 2.7 * nrows))
+    for ax, var in zip(axes.flat, variables):
+        shares = weighted_shares(var)
+        colors = [GREY if m == NON_REPONDU else BLUE for m in shares.index]
+        bars = ax.barh(shares.index.astype(str), shares.values, color=colors, height=0.7)
+        ax.bar_label(bars, fmt="%.0f", padding=2, fontsize=7, color=TEXT)
+        ax.invert_yaxis()
+        ax.set_title(var_label(var), fontsize=10)
+        ax.set_xlim(0, shares.max() * 1.2)
+        ax.grid(axis="y", visible=False)
+        ax.tick_params(axis="x", labelsize=7)
+        ax.tick_params(axis="y", labelsize=7)
+    for ax in axes.flat[len(variables):]:
+        ax.remove()
+    fig.suptitle(title, fontweight="bold")
+    plt.tight_layout(rect=(0, 0, 1, 0.97))
+    plt.show()
+
+
+plot_shares(JEUNE, "Le jeune : répartition des modalités (%, pondéré)")
+```
+
+```{python}
+plot_shares(FAMILLE, "La famille : répartition des modalités (%, pondéré)")
+```
+
+Nous avons ensuite observé le lien entre l'âge au premier alcool et chaque prédicteur, à l'aide de la moyenne pondérée de `Q19A` par modalité, avec un intervalle de confiance à 95 % approché (taille effective de Kish). Seuls les âges dans la plage plausible (6 à 25 ans) sont retenus, et les modalités de moins de 30 jeunes sont écartées. La ligne pointillée est la moyenne globale.
+
+```{python}
+clean = obs & (y >= AGE_MIN) & (y <= AGE_MAX)
+mean_clean = np.average(y[clean], weights=w[clean])
+
+
+def weighted_mean_ci(group: pd.DataFrame) -> pd.Series:
+    yy, ww = group["y"], group["w"]
+    if ww.sum() == 0:
+        return pd.Series({"mean": np.nan, "ci": np.nan, "n": 0})
+    m = np.average(yy, weights=ww)
+    var = np.average((yy - m) ** 2, weights=ww)
+    n_eff = ww.sum() ** 2 / (ww**2).sum()
+    return pd.Series({"mean": m, "ci": 1.96 * np.sqrt(var / n_eff), "n": len(yy)})
+
+
+def mean_by(var: str, mask=clean) -> pd.DataFrame:
+    data = pd.DataFrame({"mod": as_labels(var), "y": y, "w": w})[mask]
+    return data.groupby("mod", observed=False)[["y", "w"]].apply(weighted_mean_ci)
+
+
+def plot_means(variables, title):
+    ncols = 3
+    nrows = int(np.ceil(len(variables) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(11, 2.7 * nrows), sharex=True)
+    for ax, var in zip(axes.flat, variables):
+        stats = mean_by(var)
+        stats = stats[stats["n"] >= 30]  # modalités trop rares écartées
+        pos = np.arange(len(stats))
+        colors = [GREY if m == NON_REPONDU else BLUE for m in stats.index]
+        ax.errorbar(stats["mean"], pos, xerr=stats["ci"], fmt="none", ecolor=colors,
+                    elinewidth=1.5, capsize=0)
+        ax.scatter(stats["mean"], pos, color=colors, s=24, zorder=3, edgecolor="white",
+                   linewidth=1)
+        ax.set_yticks(pos, [f"{m} (n={int(n)})" for m, n in zip(stats.index, stats["n"])],
+                      fontsize=7)
+        ax.set_ylim(len(stats) - 0.5, -0.5)
+        ax.axvline(mean_clean, color=TEXT, linestyle=":", linewidth=1)
+        ax.set_title(var_label(var), fontsize=10)
+        ax.grid(axis="y", visible=False)
+        ax.tick_params(axis="x", labelsize=7, labelbottom=True)
+    for ax in axes.flat[len(variables):]:
+        ax.remove()
+    for ax in axes.flat[: len(variables)][-ncols:]:
+        ax.set_xlabel("Âge moyen au premier alcool (ans)")
+    fig.suptitle(title, fontweight="bold")
+    plt.tight_layout(rect=(0, 0, 1, 0.97))
+    plt.show()
+
+
+plot_means(JEUNE, "Le jeune : âge moyen au premier alcool par modalité (pondéré, IC 95 %)")
+```
+
+```{python}
+plot_means(FAMILLE, "La famille : âge moyen au premier alcool par modalité (pondéré, IC 95 %)")
+```
+
+On observe notamment que la consommation d'alcool des parents semble avoir un effet important sur l'âge de la première consommation des enfants : plus la mère ou le père consomment régulièrement, plus l'enfant a tendance à consommer tôt. Cette hypothèse semble confirmée lorsque l'on croise les habitudes de consommation du père et de la mère et qu'on observe l'âge moyen de première consommation des enfants. Dans le graphique suivant, les cases de moins de 30 répondants sont masquées.
+
+```{python}
+m = clean & df["B08A"].notna() & df["B08B"].notna()
+grid = pd.DataFrame({"pere": df["B08A"], "mere": df["B08B"], "y": y, "w": w})[m]
+grid["yw"] = grid["y"] * grid["w"]
+agg = grid.groupby(["pere", "mere"]).agg(yw=("yw", "sum"), w=("w", "sum"), n=("y", "size"))
+heat = (agg["yw"] / agg["w"]).where(agg["n"] >= 30).unstack()
+counts = agg["n"].unstack()
+
+fig, ax = plt.subplots(figsize=(7, 5.5))
+cmap = LinearSegmentedColormap.from_list("blue_ramp", BLUE_RAMP[::-1])  # foncé = précoce
+im = ax.imshow(heat.values, cmap=cmap, aspect="auto")
+for i in range(heat.shape[0]):
+    for j in range(heat.shape[1]):
+        v = heat.values[i, j]
+        if not np.isnan(v):
+            ax.text(j, i, f"{v:.1f}\n(n={counts.values[i, j]})", ha="center", va="center",
+                    fontsize=7, color="white" if v < heat.stack().median() else "#0b0b0b")
+labels = list(ALCOOL_PARENT.values())
+ax.set_xticks(range(5), labels, rotation=30, ha="right")
+ax.set_yticks(range(5), labels)
+ax.set_xlabel("La mère boit à la maison (B08B)")
+ax.set_ylabel("Le père boit à la maison (B08A)")
+ax.set_title("Âge moyen au premier alcool selon la consommation des parents")
+ax.grid(False)
+fig.colorbar(im, ax=ax, label="Âge moyen (ans)", shrink=0.8)
+plt.tight_layout()
+plt.show()
+```
+
+Nous avons également observé la distribution de l'âge de première consommation selon le sexe. Si la majorité des filles comme des garçons consomment leur premier verre d'alcool entre 14 et 16 ans, on remarque que les garçons sont plus nombreux à consommer plus jeunes.
+
+```{python}
+fig, ax = plt.subplots(figsize=(8, 4))
+for code, color in ((1, BLUE), (2, ORANGE)):
+    m = clean & (df["Q03"] == code)
+    d = pd.DataFrame({"age": y[m], "w": w[m]}).groupby("age")["w"].sum()
+    d = d / d.sum() * 100
+    ax.plot(d.index, d.values, color=color, linewidth=2, marker="o", markersize=5,
+            markeredgecolor="white", label=VARIABLES["Q03"][1][code])
+ax.set_xticks(range(AGE_MIN, AGE_MAX + 1))
+ax.set_xlabel("Âge au premier alcool (ans)")
+ax.set_ylabel("Part (%, pondéré)")
+ax.set_title("Distribution de l'âge au premier alcool selon le sexe")
+ax.legend(title="Sexe", fontsize=9, title_fontsize=9, loc="upper left")
+plt.tight_layout()
+plt.show()
+```
+
+## Les classes selon les principales variables
+
+Pour préparer la modélisation, nous avons enfin regardé comment la répartition des classes de la variable à prédire varie selon le sexe et la consommation d'alcool des parents, les variables qui ressortent le plus de l'analyse précédente. Les modalités de moins de 30 jeunes sont écartées.
+
+```{python}
+fig, axes = plt.subplots(3, 1, figsize=(8.5, 8), gridspec_kw={"height_ratios": [2, 5, 5]})
+for ax, var in zip(axes, ("Q03", "B08A", "B08B")):
+    data = pd.DataFrame({"mod": df_clf[var], "classe": df_clf[TARGET_CLASS], "w": wc})
+    n_mod = data["mod"].value_counts()
+    data = data[data["mod"].isin(n_mod[n_mod >= 30].index)]
+    tab = data.pivot_table(index="mod", columns="classe", values="w", aggfunc="sum",
+                           observed=True).reindex(columns=CLASSES)
+    tab = tab.div(tab.sum(axis=1), axis=0) * 100
+    left = np.zeros(len(tab))
+    for c, color in zip(CLASSES, CLASS_COLORS):
+        ax.barh(tab.index.astype(str), tab[c], left=left, color=color, height=0.7,
+                label=f"{c} ({PROFILS[c]})")
+        for y_, (l_, v) in enumerate(zip(left, tab[c])):
+            if v >= 6:
+                ax.text(l_ + v / 2, y_, f"{v:.0f}", ha="center", va="center", fontsize=7,
+                        color="white" if c != CLASSES[0] else "#0b0b0b")
+        left += tab[c].to_numpy()
+    ax.invert_yaxis()
+    ax.set_xlim(0, 100)
+    ax.set_title(var_label(var), fontsize=10)
+    ax.grid(False)
+axes[-1].set_xlabel("Part de chaque classe (%, pondéré)")
+fig.legend(*axes[0].get_legend_handles_labels(), ncols=4, loc="upper center")
+plt.tight_layout(rect=(0, 0, 1, 0.95))
+plt.show()
+```
+
+Les garçons sont plus souvent précoces que les filles (23 % contre 15 %), alors que les filles sont un peu plus souvent classiques ou tardives. La part de jeunes n'ayant jamais bu est proche pour les deux sexes (18 et 19 %).
+
+La consommation d'alcool des parents joue sur deux plans. Elle est d'abord liée au fait d'avoir bu ou non : quand le père ne boit jamais à la maison, 41 % des jeunes n'ont jamais bu, contre 9 à 16 % quand il boit. Pour la mère, c'est 34 % contre 9 à 13 %. Elle est ensuite liée à la précocité : plus les parents boivent souvent, plus les jeunes sont précoces. La part de précoces passe de 10 % quand le père ne boit jamais à 27 % quand il boit presque chaque jour (de 12 % à 29 % pour la mère), et la part de tardifs diminue.
+
+Ces variables devraient donc surtout aider à repérer les jeunes n'ayant jamais bu, et dans une moindre mesure les précoces.
+
+# Les modèles
+
+## Mise en place
+
+### Variables explicatives
+
+Les modèles utilisent 13 variables explicatives : le sexe, le redoublement, les difficultés de lecture et d'écriture, la consommation d'alcool du père et de la mère, la variable `SITUATION`, le lieu de vie, la vie des parents, et la situation et la PCS de chaque parent. Toutes sont traitées comme des variables catégorielles : chaque modalité devient une indicatrice (0 ou 1), et la non-réponse est une modalité comme les autres, sans imputation. Les modalités de moins de 30 jeunes sont regroupées en une modalité « rare ». On obtient ainsi 81 indicatrices sur l'échantillon d'apprentissage.
+
+Certaines variables sont exclues : l'identifiant `A01`, le poids de sondage `pm17B` (utilisé comme pondération et non comme prédicteur), `Q04`, `Q04A` et `Q04B` (résumées par `SITUATION`) et bien sûr l'âge au premier alcool lui-même.
+
+### Protocole
+
+Nous avons suivi le même protocole pour tous les modèles. Les données sont découpées en un échantillon d'apprentissage (80 %, soit 10 648 jeunes) et un échantillon test (20 %, soit 2 663 jeunes), avec la même répartition des classes dans les deux échantillons. Les hyperparamètres sont choisis par validation croisée à 5 plis sur l'échantillon d'apprentissage, en minimisant la log-loss. Le modèle retenu est ensuite réappris sur tout l'échantillon d'apprentissage et évalué une seule fois sur l'échantillon test. L'apprentissage et toutes les mesures de performance sont pondérés par `pm17B`.
+
+### Les indicateurs de performance
+
+Pour chaque modèle, nous présentons un tableau avec les indicateurs suivants, tous pondérés par `pm17B`. La log-loss sert de critère de choix des hyperparamètres, car elle évalue les probabilités prédites et reste informative quand le modèle prédit presque toujours la même classe.
+
+| Indicateur | Définition | Lecture |
+|---|---|---|
+| Log-loss en validation croisée | Moyenne de la log-loss sur les 5 plis de validation croisée | Plus elle est basse, meilleur est le modèle |
+| Écart-type entre les plis | Écart-type de la log-loss sur les 5 plis | Mesure l'incertitude sur la log-loss |
+| Log-loss sur le test | Log-loss du modèle retenu sur l'échantillon test | Plus elle est basse, meilleur est le modèle |
+| Accuracy | Part des jeunes du test classés dans la bonne classe | Plus elle est haute, meilleur est le modèle (40,7 % en prédisant toujours la classe majoritaire) |
+| F1 macro | Moyenne des F1 des quatre classes | Entre 0 et 1, faible quand certaines classes ne sont jamais prédites |
+| AUC macro | Moyenne des AUC de chaque classe contre toutes les autres (One-vs-Rest) | Entre 0,5 (hasard) et 1 (séparation parfaite) |
+| Hyperparamètres | Valeurs retenues par la validation croisée | |
+
+: Indicateurs présentés pour chaque modèle {#tbl-indicateurs}
+
+```{python}
+#| include: false
+Xc = df_clf[FEATURES]
+Xc_train, Xc_test, yc_train, yc_test, wc_train, wc_test = train_test_split(
+    Xc, yc, wc, test_size=0.2, stratify=yc, random_state=SEED
+)
+CV = list(StratifiedKFold(5, shuffle=True, random_state=SEED).split(Xc_train, yc_train))
+
+HYPER = {
+    "C": "C (inverse de la pénalité)",
+    "l1_ratio": "part de pénalité L1",
+    "max_depth": "profondeur maximale des arbres",
+    "min_samples_leaf": "nombre minimal de jeunes par feuille",
+    "estimator__min_samples_leaf": "nombre minimal de jeunes par feuille",
+    "max_samples": "taille des échantillons bootstrap (part)",
+    "max_features": "part des variables tirées à chaque coupure",
+    "learning_rate": "taux d'apprentissage",
+    "n_estimators": "nombre d'arbres",
+    "max_iter": "nombre d'itérations",
+    "max_leaf_nodes": "nombre maximal de feuilles par arbre",
+    "l2_regularization": "régularisation L2",
+    "colsample_bytree": "part des variables tirées par arbre",
+}
+
+
+def make_pipe(estimator) -> Pipeline:
+    """Encodage des variables suivi du modèle."""
+    return Pipeline([("prep", make_preprocessor()), ("model", estimator)])
+
+
+def logloss_score(pipe, X, y, w):
+    return log_loss(y, pipe.predict_proba(X), sample_weight=w, labels=pipe.classes_)
+
+
+def _fit_score(estimator, params, train_idx, val_idx):
+    pipe = make_pipe(clone(estimator).set_params(**params))
+    pipe.fit(Xc_train.iloc[train_idx], yc_train.iloc[train_idx],
+             model__sample_weight=wc_train.iloc[train_idx].to_numpy())
+    return logloss_score(pipe, Xc_train.iloc[val_idx], yc_train.iloc[val_idx],
+                         wc_train.iloc[val_idx])
+
+
+def grid_search(estimator, grid):
+    """Meilleure combinaison d'hyperparamètres (log-loss minimale) en validation croisée."""
+    combos = list(ParameterGrid(grid or {}))
+    scores = Parallel(n_jobs=N_JOBS)(
+        delayed(_fit_score)(estimator, p, tr, va) for p in combos for tr, va in CV
+    )
+    scores = np.asarray(scores).reshape(len(combos), len(CV))
+    best = scores.mean(1).argmin()
+    return combos[best], scores[best].mean(), scores[best].std()
+
+
+RESULTS, FITTED = {}, {}
+
+
+def evaluate(name, estimator, grid=None):
+    """Règle les hyperparamètres en CV, réapprend sur tout l'apprentissage, évalue sur le test."""
+    params, cv_mean, cv_std = grid_search(estimator, grid)
+    pipe = make_pipe(clone(estimator).set_params(**params))
+    pipe.fit(Xc_train, yc_train, model__sample_weight=wc_train.to_numpy())
+    pred, proba = pipe.predict(Xc_test), pipe.predict_proba(Xc_test)
+    FITTED[name] = pipe
+    RESULTS[name] = {
+        "logloss_cv": cv_mean,
+        "logloss_cv_std": cv_std,
+        "logloss_test": logloss_score(pipe, Xc_test, yc_test, wc_test),
+        "accuracy": accuracy_score(yc_test, pred, sample_weight=wc_test),
+        "f1": f1_score(yc_test, pred, average="macro", sample_weight=wc_test),
+        "auc": roc_auc_score(yc_test, proba, multi_class="ovr", average="macro",
+                             sample_weight=wc_test, labels=pipe.classes_),
+        "params": params,
+    }
+    return result_table(name)
+
+
+def fmt_param(v):
+    return fr(v, 3).rstrip("0").rstrip(",") if isinstance(v, float) else str(v)
+
+
+def result_table(name) -> pd.DataFrame:
+    r = RESULTS[name]
+    rows = {
+        "Log-loss en validation croisée (moyenne des 5 plis)": fr(r["logloss_cv"], 3),
+        "Écart-type de la log-loss entre les 5 plis": fr(r["logloss_cv_std"], 3),
+        "Log-loss sur l'échantillon test": fr(r["logloss_test"], 3),
+        "Accuracy sur le test (part de bien classés)": pct(r["accuracy"] * 100),
+        "F1 macro sur le test": fr(r["f1"], 3),
+        "AUC macro sur le test": fr(r["auc"], 3),
+    }
+    if not r["params"]:
+        rows["Hyperparamètres"] = "aucun"
+    for k, v in r["params"].items():
+        rows[f"Hyperparamètre : {HYPER.get(k, k)}"] = fmt_param(v)
+    return pd.DataFrame({name: rows})
+```
+
+## Les modèles de référence
+
+### La classe majoritaire
+
+Ce modèle attribue à chaque jeune les fréquences des classes comme probabilités et prédit toujours la classe « 14-15 ans ». Il sert de référence.
+
+```{python}
+#| label: tbl-res-majoritaire
+#| tbl-cap: "Résultats de la classe majoritaire"
+evaluate("Classe majoritaire", DummyClassifier(strategy="prior"))
+```
+
+On obtient une log-loss de 1,326, une accuracy de 40,7 % (la part des 14-15 ans) et une AUC de 0,5.
+
+### Les régressions logistiques pénalisées
+
+Nous estimons une régression logistique multinomiale avec trois pénalités : ridge, lasso et elastic net. Le paramètre `C` (inverse de la force de la pénalité) est choisi parmi 9 valeurs entre 0,001 et 10, et la part de L1 de l'elastic net parmi 0,25, 0,5 et 0,75.
+
+```{python}
+#| label: tbl-res-ridge
+#| tbl-cap: "Résultats de la régression logistique ridge"
+evaluate(
+    "Logistique ridge",
+    LogisticRegression(max_iter=5000),
+    {"C": [float(c) for c in np.logspace(-3, 1, 9)]},
+)
+```
+
+```{python}
+#| label: tbl-res-lasso
+#| tbl-cap: "Résultats de la régression logistique lasso"
+evaluate(
+    "Logistique lasso",
+    LogisticRegression(l1_ratio=1.0, solver="saga", max_iter=5000),
+    {"C": [float(c) for c in np.logspace(-3, 1, 9)]},
+)
+```
+
+```{python}
+#| label: tbl-res-enet
+#| tbl-cap: "Résultats de la régression logistique elastic net"
+evaluate(
+    "Logistique elastic net",
+    LogisticRegression(solver="saga", max_iter=5000),
+    {"C": [float(c) for c in np.logspace(-3, 1, 9)], "l1_ratio": [0.25, 0.5, 0.75]},
+)
+```
+
+Les trois pénalités donnent des résultats quasi identiques, avec une log-loss de 1,239 à 1,240 sur le test, une accuracy d'environ 45,5 % et une AUC de 0,646 à 0,647. La log-loss baisse d'environ 6,5 % par rapport à la classe majoritaire. La validation croisée retient une pénalité assez forte pour le ridge (C ≈ 0,03), et un mélange à parts égales de L1 et de L2 pour l'elastic net.
+
+Les tableaux suivants donnent le nombre d'indicatrices utilisées par chaque modèle, puis la liste des modalités écartées par le lasso, en précisant si l'elastic net les écarte aussi.
+
+```{python}
+#| label: tbl-lasso-count
+#| tbl-cap: "Nombre d'indicatrices utilisées par chaque régression logistique"
+LOGITS = ("Logistique ridge", "Logistique lasso", "Logistique elastic net")
+coef_names = FITTED["Logistique ridge"].named_steps["prep"].get_feature_names_out()
+nonzero = pd.DataFrame(
+    {n: np.abs(FITTED[n].named_steps["model"].coef_).max(0) > 1e-10 for n in LOGITS},
+    index=coef_names,
+)
+pd.DataFrame(
+    {
+        "Indicatrices utilisées": nonzero.sum(),
+        "Indicatrices écartées": (~nonzero).sum(),
+    }
+).rename_axis("Modèle")
+```
+
+```{python}
+#| label: tbl-lasso-drop
+#| tbl-cap: "Modalités écartées par le lasso, et par l'elastic net"
+
+
+dropped = nonzero[~nonzero["Logistique lasso"]]
+split = [n.split("_", 1) for n in dropped.index]
+pd.DataFrame(
+    {
+        "Variable": [var_label(v) for v, _ in split],
+        "Modalité écartée par le lasso": [
+            "modalités rares regroupées" if m == "infrequent_sklearn" else m for _, m in split
+        ],
+        "Écartée aussi par l'elastic net": np.where(dropped["Logistique elastic net"], "non", "oui"),
+    }
+).set_index("Variable")
+```
+
+Le lasso ne garde que 52 indicatrices sur 81, sans perdre en performance. L'elastic net en écarte 14, qui font toutes partie des 29 écartées par le lasso, et le ridge n'en écarte aucune. Le lasso écarte les modalités « Parfois » et « Souvent » des difficultés de lecture, la plupart des non-réponses (redoublement, difficultés d'écriture, lieu de vie, vie des parents, situation du père) et une partie des modalités de `SITUATION`, du lieu de vie, de la vie, de la situation et de la PCS des parents : une fois les autres variables connues, ces modalités n'apportent rien de plus. À l'inverse, il garde toutes les modalités de la consommation d'alcool du père et de la mère, y compris leur non-réponse.
+
+### L'arbre de décision
+
+Nous réglons la profondeur maximale de l'arbre (entre 3 et 12) et le nombre minimal de jeunes par feuille (entre 50 et 400).
+
+```{python}
+#| label: tbl-res-arbre
+#| tbl-cap: "Résultats de l'arbre de décision"
+evaluate(
+    "Arbre",
+    DecisionTreeClassifier(random_state=SEED),
+    {"max_depth": [3, 4, 6, 8, 10, 12], "min_samples_leaf": [50, 100, 200, 400]},
+)
+```
+
+L'arbre retenu a une profondeur de 6, avec au moins 200 jeunes par feuille. C'est le moins bon des modèles (log-loss de 1,262, AUC de 0,620), mais il fait nettement mieux que la classe majoritaire.
+
+## Le bagging et la forêt aléatoire
+
+Les deux méthodes agrègent 300 arbres. Pour le bagging, nous réglons le nombre minimal de jeunes par feuille et la taille des échantillons bootstrap. Pour la forêt aléatoire, nous réglons la part des variables tirées à chaque coupure et le nombre minimal de jeunes par feuille.
+
+```{python}
+#| label: tbl-res-bagging
+#| tbl-cap: "Résultats du bagging"
+evaluate(
+    "Bagging",
+    BaggingClassifier(DecisionTreeClassifier(), n_estimators=300, random_state=SEED, n_jobs=1),
+    {"estimator__min_samples_leaf": [5, 10, 20, 50, 100], "max_samples": [0.2, 0.5, 1.0]},
+)
+```
+
+```{python}
+#| label: tbl-res-rf
+#| tbl-cap: "Résultats de la forêt aléatoire"
+evaluate(
+    "Forêt aléatoire",
+    RandomForestClassifier(n_estimators=300, random_state=SEED, n_jobs=1),
+    {"max_features": [0.1, 0.2, 0.33, 0.5], "min_samples_leaf": [10, 20, 50, 100]},
+)
+```
+
+Le bagging et la forêt aléatoire améliorent nettement l'arbre seul : la log-loss passe de 1,262 à environ 1,238 et l'AUC de 0,620 à environ 0,648. Le bagging retient des feuilles d'au moins 20 jeunes et des échantillons bootstrap de 20 % des données. La forêt tire 10 % des variables à chaque coupure, avec au moins 10 jeunes par feuille. Leurs performances sont comparables à celles des régressions logistiques.
+
+## Le boosting
+
+### Le gradient boosting
+
+Nous réglons le taux d'apprentissage, le nombre d'arbres et leur profondeur, avec un sous-échantillonnage de 80 % des jeunes à chaque itération.
+
+```{python}
+#| label: tbl-res-gb
+#| tbl-cap: "Résultats du gradient boosting"
+evaluate(
+    "Gradient boosting",
+    GradientBoostingClassifier(subsample=0.8, random_state=SEED),
+    {
+        "learning_rate": [0.01, 0.02, 0.05, 0.1],
+        "n_estimators": [100, 300, 600],
+        "max_depth": [1, 2, 3],
+    },
+)
+```
+
+Le gradient boosting retient des arbres de profondeur 2, 600 arbres et un taux d'apprentissage faible (0,02). Il obtient une log-loss de 1,235, la meilleure accuracy (45,7 %) et le meilleur F1 macro (0,311) de tous les modèles.
+
+### Le boosting par histogrammes
+
+Nous réglons le taux d'apprentissage, le nombre d'itérations, le nombre maximal de feuilles par arbre, le nombre minimal de jeunes par feuille et la régularisation L2.
+
+```{python}
+#| label: tbl-res-hgb
+#| tbl-cap: "Résultats du boosting par histogrammes"
+evaluate(
+    "Hist. gradient boosting",
+    HistGradientBoostingClassifier(early_stopping=False, random_state=SEED),
+    {
+        "learning_rate": [0.01, 0.03, 0.1],
+        "max_iter": [100, 300],
+        "max_leaf_nodes": [3, 7, 15],
+        "min_samples_leaf": [20, 80],
+        "l2_regularization": [0.0, 1.0],
+    },
+)
+```
+
+Le boosting par histogrammes retient des arbres très simples (3 feuilles), 100 itérations et une régularisation L2. Ses performances sont proches de celles du gradient boosting (log-loss de 1,238, accuracy de 45,3 %).
+
+### XGBoost
+
+Nous utilisons la même grille que pour le gradient boosting, avec en plus la part des variables tirées pour chaque arbre.
+
+```{python}
+#| label: tbl-res-xgb
+#| tbl-cap: "Résultats de XGBoost"
+class XGBLabelClassifier(XGBClassifier):
+    """XGBClassifier acceptant des classes textuelles."""
+
+    @property
+    def classes_(self):
+        # pendant le fit, XGBoost compare classes_ aux codes 0..K-1
+        le = getattr(self, "label_encoder_", None)
+        return le.classes_ if le is not None else np.arange(self.n_classes_)
+
+    def fit(self, X, y, **kwargs):
+        self.label_encoder_ = None
+        le = LabelEncoder().fit(y)
+        super().fit(X, le.transform(y), **kwargs)
+        self.label_encoder_ = le
+        return self
+
+    def predict(self, X):
+        return self.label_encoder_.inverse_transform(super().predict(X))
+
+
+evaluate(
+    "XGBoost",
+    XGBLabelClassifier(subsample=0.8, tree_method="hist", n_jobs=1, random_state=SEED),
+    {
+        "learning_rate": [0.02, 0.05, 0.1],
+        "n_estimators": [100, 300, 600],
+        "max_depth": [1, 2, 3],
+        "colsample_bytree": [0.8, 1.0],
+    },
+)
+```
+
+XGBoost retient lui aussi des arbres de profondeur 2, avec 300 arbres et un taux d'apprentissage de 0,05. Il obtient des performances très proches du gradient boosting (log-loss de 1,236, AUC de 0,647).
+
+## Le stacking
+
+Le stacking combine la régression logistique ridge, la forêt aléatoire et le boosting par histogrammes, avec leurs hyperparamètres retenus. Leurs probabilités prédites, obtenues par validation croisée interne à 5 plis, sont combinées par une régression logistique.
+
+```{python}
+#| label: tbl-res-stacking
+#| tbl-cap: "Résultats du stacking"
+base = [
+    ("logit", FITTED["Logistique ridge"].named_steps["model"]),
+    ("rf", FITTED["Forêt aléatoire"].named_steps["model"]),
+    ("hgb", FITTED["Hist. gradient boosting"].named_steps["model"]),
+]
+evaluate(
+    "Stacking",
+    StackingClassifier(
+        [(n, clone(m)) for n, m in base],
+        final_estimator=LogisticRegression(max_iter=5000),
+        stack_method="predict_proba",
+        cv=5,
+        n_jobs=1,
+    ),
+)
+```
+
+Le stacking obtient la meilleure log-loss (1,233) et la meilleure AUC (0,649). Le gain reste toutefois faible par rapport aux modèles qu'il combine.
+
+## Comparaison des modèles
+
+Le tableau suivant reprend les indicateurs de tous les modèles, du meilleur au moins bon selon la log-loss sur le test. La dernière colonne donne la baisse de la log-loss par rapport à la classe majoritaire.
+
+```{python}
+#| label: tbl-comparaison
+#| tbl-cap: "Comparaison des modèles (du meilleur au moins bon)"
+res = pd.DataFrame(RESULTS).T.drop(columns="params").astype(float)
+baseline = res.loc["Classe majoritaire", "logloss_test"]
+res["gain"] = (1 - res["logloss_test"] / baseline) * 100
+res = res.sort_values("logloss_test")
+pd.DataFrame(
+    {
+        "Log-loss (validation croisée)": res["logloss_cv"].map(lambda x: fr(x, 3)),
+        "Écart-type (validation croisée)": res["logloss_cv_std"].map(lambda x: fr(x, 3)),
+        "Log-loss (test)": res["logloss_test"].map(lambda x: fr(x, 3)),
+        "Accuracy (test)": (res["accuracy"] * 100).map(pct),
+        "F1 macro (test)": res["f1"].map(lambda x: fr(x, 3)),
+        "AUC macro (test)": res["auc"].map(lambda x: fr(x, 3)),
+        "Baisse de la log-loss vs classe majoritaire": res["gain"].map(pct),
+    }
+).rename_axis("Modèle")
+```
+
+```{python}
+REFERENCES = ("Classe majoritaire", *LOGITS, "Arbre")
+order = res.sort_values("logloss_test", ascending=False)
+best = next(n for n in order.index[::-1] if n not in REFERENCES)
+
+colors = [GREY if n in REFERENCES else BLUE for n in order.index]
+pos = np.arange(len(order))
+panels = (
+    ("logloss_test", "Log-loss (plus bas = meilleur)", 3),
+    ("accuracy", "Accuracy (plus haut = meilleur)", 3),
+    ("f1", "F1 macro (plus haut = meilleur)", 3),
+    ("auc", "AUC macro (plus haut = meilleur)", 3),
+)
+fig, axes = plt.subplots(2, 2, figsize=(10, 7.5), sharey=True)
+for ax, (metric, title, digits) in zip(axes.flat, panels):
+    ax.hlines(pos, order[metric].min(), order[metric], color="#e4e3df", linewidth=1)
+    ax.scatter(order[metric], pos, color=colors, s=40, zorder=3, edgecolor="white")
+    for p_, v in zip(pos, order[metric]):
+        ax.annotate(f"{v:.{digits}f}", (v, p_), xytext=(0, 6), textcoords="offset points",
+                    ha="center", fontsize=7, color=TEXT)
+    ax.set_title(title, fontsize=10)
+    ax.set_yticks(pos, order.index)
+    ax.set_ylim(-0.6, len(order) - 0.3)
+    ax.grid(axis="y", visible=False)
+fig.suptitle("Performances sur l'échantillon test (gris : modèles de référence, "
+             "bleu : méthodes d'agrégation)", fontweight="bold", fontsize=10)
+plt.tight_layout(rect=(0, 0, 1, 0.96))
+plt.show()
+```
+
+Tous les modèles battent la classe majoritaire, mais les écarts entre eux sont faibles. Les méthodes d'agrégation (en bleu) réduisent la log-loss de 6,5 à 7,0 %, les régressions logistiques de 6,5 % et l'arbre seul de 4,8 %. Les régressions logistiques font donc presque aussi bien que les méthodes d'agrégation : l'écart entre la meilleure régression logistique et le stacking (0,006) est du même ordre que l'écart-type de la log-loss entre les plis de validation croisée (environ 0,006). On ne peut donc pas vraiment départager ces modèles. L'accuracy ne dépasse pas 45,7 %, soit 5 points de plus que la classe majoritaire.
+
+## Analyse du meilleur modèle
+
+### Matrice de confusion
+
+Nous analysons maintenant le meilleur modèle d'agrégation. Dans la matrice de confusion, chaque ligne correspond à la classe observée et somme à 100 %.
+
+```{python}
+pred = FITTED[best].predict(Xc_test)
+cm = confusion_matrix(yc_test, pred, labels=CLASSES, sample_weight=wc_test)
+cm_pct = cm / cm.sum(1, keepdims=True) * 100
+
+fig, ax = plt.subplots(figsize=(6.5, 5))
+im = ax.imshow(cm_pct, cmap=LinearSegmentedColormap.from_list("ramp", CM_RAMP),
+               vmin=0, vmax=100)
+for i in range(len(CLASSES)):
+    for j in range(len(CLASSES)):
+        ax.text(j, i, f"{cm_pct[i, j]:.0f} %", ha="center", va="center", fontsize=8,
+                color="white" if cm_pct[i, j] > 55 else "#0b0b0b")
+ax.set_xticks(range(len(CLASSES)), CLASSES, rotation=30, ha="right")
+ax.set_yticks(range(len(CLASSES)), CLASSES)
+ax.set_xlabel("Classe prédite")
+ax.set_ylabel("Classe observée")
+ax.set_title(f"{best} : matrice de confusion (test)")
+ax.grid(False)
+fig.colorbar(im, ax=ax, label="% de la classe observée", shrink=0.8)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+#| label: tbl-par-classe
+#| tbl-cap: "Classes observées et prédites par le meilleur modèle (test)"
+pred_share = wc_test.groupby(pd.Series(pred, index=yc_test.index)).sum() / wc_test.sum() * 100
+obs_share = wc_test.groupby(yc_test).sum() / wc_test.sum() * 100
+f1_class = pd.Series(
+    f1_score(yc_test, pred, labels=CLASSES, average=None, sample_weight=wc_test), index=CLASSES
+)
+pd.DataFrame(
+    {
+        "Part observée (%)": obs_share.reindex(CLASSES).map(pct),
+        "Part prédite (%)": pred_share.reindex(CLASSES).fillna(0).map(pct),
+        "Bien classés (% de la classe)": pd.Series(np.diag(cm_pct), index=CLASSES).map(pct),
+        "F1": f1_class.map(lambda x: fr(x, 3)),
+    },
+    index=CLASSES,
+).rename_axis("Classe")
+```
+
+Le modèle classe environ 82 % des jeunes dans la classe « 14-15 ans ». Les classes « ≤ 13 ans » et « ≥ 16 ans » ne sont presque jamais prédites (1,4 % des prédictions chacune, F1 d'environ 0,05). Seule la classe « Non concerné » est en partie reconnue : 44 % des jeunes n'ayant jamais bu sont bien classés.
+
+### Probabilités et AUC par classe
+
+Le modèle ne prédit presque jamais les classes précoce et tardive. Pour voir s'il contient malgré tout de l'information sur ces classes, le tableau suivant donne, pour les jeunes de chaque classe observée (en ligne), la probabilité moyenne prédite pour chaque classe (en colonne), ainsi que la fréquence de base de chaque classe.
+
+```{python}
+#| label: tbl-proba
+#| tbl-cap: "Probabilité moyenne attribuée à chaque classe (en %), selon la classe observée"
+proba = pd.DataFrame(FITTED[best].predict_proba(Xc_test),
+                     columns=FITTED[best].classes_, index=yc_test.index)[CLASSES]
+mean_proba = proba.mul(wc_test, axis=0).groupby(yc_test).sum().div(
+    wc_test.groupby(yc_test).sum(), axis=0
+).reindex(CLASSES) * 100
+mean_proba.loc["Fréquence de base"] = (
+    wc_train.groupby(yc_train).sum().reindex(CLASSES) / wc_train.sum() * 100
+)
+mean_proba.columns = [f"Probabilité « {c} »" for c in CLASSES]
+mean_proba.map(lambda x: fr(x, 1)).rename_axis("Classe observée")
+```
+
+Il faut lire ce tableau par colonne. Dans la colonne « Non concerné », les jeunes qui n'ont jamais bu reçoivent en moyenne une probabilité de 30,7 %, contre 12,6 à 18,7 % pour les autres et 18,2 % pour la fréquence de base : le modèle les repère assez bien. Dans la colonne « ≤ 13 ans », les précoces reçoivent 23,5 %, contre 14,4 à 20,6 % pour les autres : le signal existe, mais il est plus faible. Pour les tardifs, l'écart est minime (23,3 % contre 20,4 à 22,2 %).
+
+Lu par ligne, le tableau explique pourquoi les précoces ne sont jamais prédits : même pour eux, la probabilité « 14-15 ans » (43,5 %) reste bien plus forte que la probabilité « ≤ 13 ans » (23,5 %).
+
+Le tableau suivant donne l'AUC de chaque classe contre toutes les autres, pour la régression logistique ridge, XGBoost et le meilleur modèle d'agrégation.
+
+```{python}
+#| label: tbl-auc
+#| tbl-cap: "AUC par classe (une classe contre toutes les autres, test)"
+auc_class = pd.DataFrame(
+    {
+        name: [
+            roc_auc_score(yc_test == c, FITTED[name].predict_proba(Xc_test)[:, i],
+                          sample_weight=wc_test)
+            for i, c in enumerate(FITTED[name].classes_)
+        ]
+        for name in ("Logistique ridge", "XGBoost", best)
+    },
+    index=FITTED[best].classes_,
+).reindex(CLASSES)
+auc_class.loc["Moyenne (AUC macro)"] = auc_class.mean()
+auc_class.map(lambda x: fr(x, 3)).rename_axis("Classe")
+```
+
+Les jeunes n'ayant jamais bu sont les mieux repérés (AUC de 0,735), puis les précoces (0,670). Les classes « 14-15 ans » et « ≥ 16 ans » sont à peine mieux séparées qu'au hasard (0,606 et 0,585). La régression logistique ridge et XGBoost donnent des AUC presque identiques à celles du stacking : la limite vient des variables disponibles plus que du choix du modèle.
+
+### Importance des variables
+
+Nous mesurons la hausse de la log-loss sur l'échantillon test quand on permute les valeurs d'une variable (importance par permutation, 20 répétitions), pour la régression logistique ridge et le meilleur modèle d'agrégation.
+
+```{python}
+imp = {}
+for name in ("Logistique ridge", best):
+    r = permutation_importance(
+        FITTED[name], Xc_test, yc_test, sample_weight=wc_test.to_numpy(),
+        scoring="neg_log_loss", n_repeats=20, random_state=SEED, n_jobs=N_JOBS,
+    )
+    imp[name] = pd.Series(r.importances_mean, index=FEATURES)
+imp = pd.DataFrame(imp).sort_values(best)
+
+fig, ax = plt.subplots(figsize=(8, 5))
+pos = np.arange(len(imp))
+ax.barh(pos + 0.2, imp[best], height=0.38, color=BLUE, label=best)
+ax.barh(pos - 0.2, imp["Logistique ridge"], height=0.38, color=GREY, label="Logistique ridge")
+ax.set_yticks(pos, [var_label(v) for v in imp.index])
+ax.axvline(0, color=TEXT, linewidth=0.8)
+ax.set_xlabel("Hausse de la log-loss quand la variable est permutée")
+ax.set_title("Importance des variables par permutation")
+ax.legend(loc="lower right")
+ax.grid(axis="y", visible=False)
+plt.tight_layout()
+plt.show()
+```
+
+La consommation d'alcool des parents domine très nettement : permuter celle du père ou celle de la mère fait perdre bien plus que toute autre variable. Viennent ensuite le sexe, puis la PCS de la mère, la vie des parents et `SITUATION`. Les difficultés de lecture et d'écriture n'apportent rien. La régression logistique et le stacking s'accordent sur ce classement.
+
+# Conclusion
+
+Le pouvoir prédictif de nos modèles est faible. Le meilleur modèle, le stacking, réduit la log-loss de 7 % par rapport à la classe majoritaire, et son accuracy (45,6 %) ne dépasse la référence (40,7 %) que de 5 points. Les variables disponibles, qui décrivent la situation personnelle et le contexte familial des jeunes, n'expliquent qu'une petite partie de l'âge au premier alcool.
+
+Les méthodes d'agrégation font à peine mieux que la régression logistique. Elles réduisent la log-loss de 6,5 à 7,0 %, contre 6,5 % pour les régressions logistiques et 4,8 % pour l'arbre seul, et ces écarts restent de l'ordre de l'incertitude mesurée en validation croisée.
+
+En pratique, le meilleur modèle prédit presque toujours la classe « 14-15 ans », dans laquelle il place environ 82 % des jeunes. Les classes précoce et tardive ne sont presque jamais prédites, et seuls les jeunes n'ayant jamais bu sont en partie reconnus (44 % bien classés, AUC de 0,735). Le signal existe pourtant : les probabilités prédites s'écartent des fréquences de base dans le bon sens, en particulier pour les jeunes n'ayant jamais bu et pour les précoces (AUC de 0,670), mais pas assez pour changer la classe prédite.
+
+La consommation d'alcool des parents est de loin la variable la plus importante, suivie du sexe. Cela rejoint l'analyse descriptive, où la consommation des parents distinguait surtout les jeunes n'ayant jamais bu, et dans une moindre mesure les précoces.
+
+Pour mieux repérer les précoces et les tardifs, on pourrait modifier la règle de décision, par exemple en fixant des seuils sur les probabilités ou en pondérant les classes, au prix d'une accuracy plus faible.

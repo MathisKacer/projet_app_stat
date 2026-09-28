@@ -9,12 +9,9 @@ jupyter: python3
 
 # Introduction
 
-Après l'analyse descriptive du jeu de données ESCAPAD 2017, nous cherchons maintenant à prédire l'âge au premier alcool à partir des caractéristiques des jeunes et de leur contexte familial. Nous avons abordé le problème de deux façons :
+Après l'analyse descriptive du jeu de données ESCAPAD 2017, nous cherchons maintenant à prédire l'âge au premier alcool à partir des caractéristiques des jeunes et de leur contexte familial. Nous avons choisi de traiter ce problème comme une **classification** : l'âge au premier alcool est découpé en classes (≤ 13 ans, 14-15 ans, ≥ 16 ans), auxquelles on ajoute une classe « Non concerné » pour les jeunes n'ayant jamais bu. Cela permet de modéliser tous les jeunes, y compris ceux qui n'ont jamais bu, et d'éviter que les âges extrêmes (1 à 5 ans) pèsent plus que les autres.
 
-- une **régression**, où l'on prédit l'âge au premier alcool `Q19A` comme une variable continue, pour les jeunes ayant déjà bu ;
-- une **classification**, où l'on prédit une classe d'âge (≤ 13 ans, 14-15 ans, ≥ 16 ans), en ajoutant une classe « Non concerné » pour les jeunes n'ayant jamais bu.
-
-Pour chacune des deux approches, nous présentons les modèles un par un, des plus simples (modèles de référence) aux méthodes d'agrégation (bagging, forêt aléatoire, boosting, stacking), puis nous les comparons. Nous terminons par une comparaison des deux approches.
+Nous présentons d'abord la variable discrétisée, puis les modèles un par un, des plus simples (modèles de référence) aux méthodes d'agrégation (bagging, forêt aléatoire, boosting, stacking), avant de les comparer et d'analyser le meilleur d'entre eux.
 
 # Préparation
 
@@ -23,7 +20,6 @@ Pour chacune des deux approches, nous présentons les modèles un par un, des pl
 ```{python}
 import sys
 import time
-import warnings
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -32,35 +28,27 @@ import pandas as pd
 from joblib import Parallel, delayed
 from matplotlib.colors import LinearSegmentedColormap
 from sklearn.base import clone
-from sklearn.dummy import DummyClassifier, DummyRegressor
+from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import (
     BaggingClassifier,
-    BaggingRegressor,
     GradientBoostingClassifier,
-    GradientBoostingRegressor,
     HistGradientBoostingClassifier,
-    HistGradientBoostingRegressor,
     RandomForestClassifier,
-    RandomForestRegressor,
     StackingClassifier,
-    StackingRegressor,
 )
 from sklearn.inspection import permutation_importance
-from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
     f1_score,
     log_loss,
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
     roc_auc_score,
 )
 from sklearn.model_selection import ParameterGrid, StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
-from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+from sklearn.tree import DecisionTreeClassifier
 from xgboost import XGBClassifier
 
 # Permet d'importer le package data depuis le dossier du projet
@@ -71,7 +59,7 @@ if str(ROOT) not in sys.path:
 
 from data import load_escap_data, preprocess
 from data.features import FEATURES, make_preprocessor
-from data.labels import TARGET, VARIABLES, WEIGHT
+from data.labels import NON_CONCERNE, TARGET, VARIABLES, WEIGHT
 from data.preprocess import TARGET_CLASS
 
 pd.set_option("display.width", 200)
@@ -115,7 +103,7 @@ plt.rcParams.update(
 
 ## Variables explicatives
 
-Nous utilisons les mêmes variables explicatives pour les deux approches (voir `data/features.py`) :
+Les variables explicatives sont encodées de la façon suivante (voir `data/features.py`) :
 
 - les **variables ordinales** (sexe, redoublement, difficultés de lecture et d'écriture, consommation d'alcool du père et de la mère) sont codées par un score qui conserve l'ordre des modalités. Les non-réponses sont remplacées par la médiane et signalées par une indicatrice, car elles ne sont pas aléatoires ;
 - les **variables nominales** (`SITUATION`, lieu de vie, vie des parents, situation et PCS des parents) sont codées en indicatrices. Les modalités de moins de 30 individus sont regroupées.
@@ -126,7 +114,7 @@ Certaines variables sont exclues : l'identifiant `A01`, le poids de sondage `pm1
 
 Nous avons suivi le même protocole pour tous les modèles :
 
-- un découpage 80 % apprentissage / 20 % test, stratifié sur la classe d'âge ;
+- un découpage 80 % apprentissage / 20 % test, stratifié sur la classe d'âge (même répartition des classes dans les deux échantillons) ;
 - le choix des hyperparamètres par validation croisée à 5 plis sur l'échantillon d'apprentissage ;
 - l'apprentissage et toutes les métriques sont pondérés par `pm17B` ;
 - l'échantillon test n'est utilisé qu'une fois, pour évaluer le modèle retenu.
@@ -168,372 +156,11 @@ def result_table(res: dict, name: str) -> pd.DataFrame:
     return out.to_frame(name)
 ```
 
-# Partie 1 : la régression
+# La variable à prédire
 
-## Les données
+## Construction des classes
 
-Pour la régression, nous prédisons l'âge au premier alcool `Q19A` comme une variable continue. Nous gardons donc uniquement les jeunes ayant déjà bu : pour ceux qui n'ont jamais bu, l'âge au premier alcool n'existe pas. Les modèles sont évalués par la RMSE pondérée (erreur quadratique moyenne, en années), la MAE (erreur absolue moyenne) et le R² (part de variance expliquée).
-
-```{python}
-df_reg = preprocess(load_escap_data())
-df_reg = df_reg[df_reg[TARGET].notna()].reset_index(drop=True)
-
-Xr, yr, wr = df_reg[FEATURES], df_reg[TARGET], df_reg[WEIGHT]
-Xr_train, Xr_test, yr_train, yr_test, wr_train, wr_test = train_test_split(
-    Xr, yr, wr, test_size=0.2, stratify=df_reg[TARGET_CLASS], random_state=SEED
-)
-CV_REG = list(
-    StratifiedKFold(5, shuffle=True, random_state=SEED).split(
-        Xr_train, df_reg.loc[Xr_train.index, TARGET_CLASS]
-    )
-)
-
-
-def weighted_rmse(y_true, y_pred, weights):
-    return np.sqrt(mean_squared_error(y_true, y_pred, sample_weight=weights))
-
-
-def rmse_score(pipe, X, y, w):
-    return weighted_rmse(y, pipe.predict(X), w)
-
-
-RES_REG, FIT_REG = {}, {}
-
-
-def evaluate_reg(name, estimator, grid=None):
-    """Choisit les hyperparamètres en CV, réapprend sur tout l'apprentissage, évalue sur le test."""
-    start = time.time()
-    params, cv_mean, cv_std = grid_search(
-        estimator, grid, Xr_train, yr_train, wr_train, CV_REG, rmse_score
-    )
-    pipe = make_pipe(clone(estimator).set_params(**params))
-    pipe.fit(Xr_train, yr_train, model__sample_weight=wr_train.to_numpy())
-    pred = pipe.predict(Xr_test)
-    FIT_REG[name] = pipe
-    RES_REG[name] = {
-        "RMSE CV": cv_mean,
-        "± CV": cv_std,
-        "RMSE test": weighted_rmse(yr_test, pred, wr_test),
-        "MAE test": mean_absolute_error(yr_test, pred, sample_weight=wr_test),
-        "R² test": r2_score(yr_test, pred, sample_weight=wr_test),
-        "temps (s)": time.time() - start,
-        "hyperparamètres": params,
-    }
-    return result_table(RES_REG[name], name)
-
-
-print(f"Jeunes ayant déjà bu : {len(df_reg)}")
-print(f"Apprentissage : {len(Xr_train)} — test : {len(Xr_test)}")
-```
-
-## Les modèles de référence
-
-### La moyenne
-
-Le premier modèle prédit simplement la moyenne pondérée de l'âge au premier alcool pour tout le monde, sans utiliser aucune variable. C'est le niveau à battre : sa RMSE est proche de l'écart-type de la cible.
-
-```{python}
-evaluate_reg("Moyenne", DummyRegressor(strategy="mean"))
-```
-
-La moyenne obtient une RMSE de 2,157 ans sur le test et un R² nul, par construction. Autrement dit, sans aucune information sur les jeunes, on se trompe en moyenne d'environ 2 ans sur leur âge au premier alcool.
-
-### La régression Ridge
-
-La régression Ridge est une régression linéaire pénalisée : la pénalité `alpha` réduit les coefficients pour limiter le sur-apprentissage. C'est notre modèle de référence interprétable.
-
-```{python}
-evaluate_reg("Ridge", Ridge(), {"alpha": [float(a) for a in np.logspace(-1, 4, 11)]})
-```
-
-La validation croisée retient une pénalité assez forte (`alpha` ≈ 316). La RMSE descend à 2,104 ans et le R² atteint 4,8 % : les variables apportent une information réelle, mais elle reste très limitée.
-
-### L'arbre de décision
-
-L'arbre de décision seul est la brique de base des méthodes d'agrégation. Nous réglons sa profondeur et le nombre minimal d'individus par feuille.
-
-```{python}
-evaluate_reg(
-    "Arbre",
-    DecisionTreeRegressor(random_state=SEED),
-    {"max_depth": [2, 3, 4, 5, 6, 8, None], "min_samples_leaf": [30, 100, 200, 400]},
-)
-```
-
-L'arbre retenu a une profondeur de 5 avec au moins 200 individus par feuille. Il fait mieux que la moyenne (RMSE de 2,129 ans) mais nettement moins bien que la régression Ridge (R² de 2,6 %) : un arbre seul est instable et découpe la population de façon trop grossière.
-
-## Le bagging
-
-Le bagging fait la moyenne de 300 arbres profonds, chacun appris sur un échantillon bootstrap. Cela réduit la variance de l'arbre seul. Nous réglons la taille des feuilles et la taille des échantillons bootstrap.
-
-```{python}
-evaluate_reg(
-    "Bagging",
-    BaggingRegressor(DecisionTreeRegressor(), n_estimators=300, random_state=SEED, n_jobs=1),
-    {"estimator__min_samples_leaf": [5, 20, 50, 100, 200], "max_samples": [0.2, 0.5, 1.0]},
-)
-```
-
-Le bagging retient des feuilles d'au moins 50 individus et des échantillons bootstrap de 20 % des données. Il améliore l'arbre seul (RMSE de 2,113 ans, R² de 4,0 %) en réduisant sa variance, sans rattraper la régression Ridge.
-
-## La forêt aléatoire
-
-La forêt aléatoire ajoute au bagging un tirage aléatoire des variables candidates à chaque coupure (`max_features`), ce qui rend les arbres moins corrélés entre eux.
-
-```{python}
-evaluate_reg(
-    "Forêt aléatoire",
-    RandomForestRegressor(n_estimators=300, random_state=SEED, n_jobs=1),
-    {"max_features": [0.1, 0.2, 0.33, 0.5], "min_samples_leaf": [5, 10, 20, 50]},
-)
-```
-
-La forêt aléatoire tire 20 % des variables à chaque coupure et garde au moins 20 individus par feuille. Elle fait un peu mieux que le bagging (RMSE de 2,111 ans, R² de 4,2 %), grâce à des arbres moins corrélés.
-
-Nous avons ensuite vérifié que 300 arbres suffisent, en suivant l'erreur *out-of-bag* (calculée sur les individus non tirés dans chaque échantillon bootstrap) selon le nombre d'arbres.
-
-```{python}
-prep = make_preprocessor().fit(Xr_train)
-Xt_train = prep.transform(Xr_train)
-n_trees = [25, 50, 100, 200, 400]
-oob = {"Bagging": [], "Forêt aléatoire": []}
-for n in n_trees:
-    for name in oob:
-        model = clone(FIT_REG[name].named_steps["model"]).set_params(
-            n_estimators=n, oob_score=True, n_jobs=N_JOBS
-        )
-        with warnings.catch_warnings():  # quelques individus sans prédiction OOB à 25 arbres
-            warnings.simplefilter("ignore", UserWarning)
-            model.fit(Xt_train, yr_train, sample_weight=wr_train.to_numpy())
-        pred = model.oob_prediction_
-        ok = ~np.isnan(pred)
-        oob[name].append(weighted_rmse(yr_train[ok], pred[ok], wr_train[ok]))
-
-fig, ax = plt.subplots(figsize=(7, 3.5))
-for (name, values), color in zip(oob.items(), (GREY, BLUE)):
-    ax.plot(n_trees, values, marker="o", color=color, linewidth=2, markersize=5,
-            markeredgecolor="white", label=name)
-ax.set_xscale("log")
-ax.set_xticks(n_trees, n_trees)
-ax.minorticks_off()
-ax.set_xlabel("Nombre d'arbres")
-ax.set_ylabel("RMSE out-of-bag (pondérée)")
-ax.set_title("Erreur OOB selon le nombre d'arbres")
-ax.legend()
-plt.tight_layout()
-plt.show()
-```
-
-La forêt aléatoire a besoin de plus d'arbres que le bagging pour se stabiliser, car chaque arbre ne voit qu'une partie des variables, mais elle finit légèrement meilleure. Au-delà de 200 arbres, l'erreur ne bouge presque plus : 300 arbres suffisent.
-
-## Le boosting
-
-Le boosting ajoute des arbres peu profonds les uns après les autres, chacun corrigeant les erreurs des précédents. Le réglage principal est le compromis entre le taux d'apprentissage et le nombre d'itérations.
-
-### Le gradient boosting
-
-```{python}
-evaluate_reg(
-    "Gradient boosting",
-    GradientBoostingRegressor(subsample=0.8, random_state=SEED),
-    {
-        "learning_rate": [0.005, 0.01, 0.02, 0.05],
-        "n_estimators": [300, 1000],
-        "max_depth": [1, 2, 3],
-    },
-)
-```
-
-Le gradient boosting retient des arbres à une seule coupure (`max_depth` = 1), 300 itérations et un taux d'apprentissage de 0,05. Ses performances rejoignent celles de la régression Ridge (RMSE de 2,104 ans, R² de 4,8 %). Des arbres à une seule coupure donnent un modèle additif, sans interactions entre variables : c'est justement ce que capte déjà une régression linéaire.
-
-Le graphique suivant montre l'erreur d'apprentissage et de validation au fil des itérations, pour trois taux d'apprentissage (20 % de l'échantillon d'apprentissage sont mis de côté pour la validation).
-
-```{python}
-Xt_fit, Xt_val, y_fit, y_val, w_fit, w_val = train_test_split(
-    Xt_train, yr_train, wr_train, test_size=0.2, random_state=SEED
-)
-fig, ax = plt.subplots(figsize=(8, 4))
-for lr, color in ((0.02, BLUE), (0.1, ORANGE), (0.5, GREY)):
-    gb = GradientBoostingRegressor(
-        learning_rate=lr, n_estimators=800, max_depth=3, subsample=0.8, random_state=SEED
-    ).fit(Xt_fit, y_fit, sample_weight=w_fit.to_numpy())
-    val = [weighted_rmse(y_val, p, w_val) for p in gb.staged_predict(Xt_val)]
-    train = [weighted_rmse(y_fit, p, w_fit) for p in gb.staged_predict(Xt_fit)]
-    ax.plot(val, color=color, linewidth=2, label=f"validation, lr = {lr}")
-    ax.plot(train, color=color, linewidth=1, linestyle="--", label=f"apprentissage, lr = {lr}")
-ax.set_xlabel("Nombre d'itérations")
-ax.set_ylabel("RMSE pondérée")
-ax.set_title("Gradient boosting : sur-apprentissage selon le taux d'apprentissage")
-ax.legend(ncols=3, loc="upper center", bbox_to_anchor=(0.5, -0.15))
-ax.set_ylim(1.7, 2.2)
-plt.tight_layout()
-plt.show()
-```
-
-Avec un taux d'apprentissage de 0,5, l'erreur de validation remonte dès les premières itérations, alors que l'erreur d'apprentissage continue de baisser : le modèle sur-apprend. Avec un taux de 0,1, l'erreur de validation atteint son minimum vers 50 à 100 itérations puis remonte lentement. Avec un taux de 0,02, elle diminue plus lentement mais reste stable jusqu'à 800 itérations. Un petit taux d'apprentissage demande donc plus d'itérations, mais il est beaucoup moins sensible au sur-apprentissage.
-
-### Le boosting par histogrammes
-
-`HistGradientBoostingRegressor` est une version plus rapide du gradient boosting, qui regroupe les valeurs des variables en histogrammes et ajoute une régularisation L2.
-
-```{python}
-evaluate_reg(
-    "Hist. gradient boosting",
-    HistGradientBoostingRegressor(early_stopping=False, random_state=SEED),
-    {
-        "learning_rate": [0.01, 0.03, 0.1],
-        "max_iter": [100, 300, 600],
-        "max_leaf_nodes": [3, 7, 15],
-        "min_samples_leaf": [20, 80],
-        "l2_regularization": [0.0, 1.0],
-    },
-)
-```
-
-Le boosting par histogrammes retient lui aussi des arbres très simples (3 feuilles), avec un taux d'apprentissage faible (0,03), 600 itérations et une régularisation L2. Il obtient une RMSE de 2,106 ans et un R² de 4,6 %, proches du gradient boosting.
-
-## Le stacking
-
-Le stacking combine les prédictions de modèles différents : la régression Ridge, la forêt aléatoire et le boosting par histogrammes, avec leurs meilleurs hyperparamètres. Leurs prédictions, obtenues par validation croisée interne, sont combinées par une régression linéaire à coefficients positifs.
-
-```{python}
-base_reg = [
-    ("ridge", FIT_REG["Ridge"].named_steps["model"]),
-    ("rf", FIT_REG["Forêt aléatoire"].named_steps["model"]),
-    ("hgb", FIT_REG["Hist. gradient boosting"].named_steps["model"]),
-]
-table = evaluate_reg(
-    "Stacking",
-    StackingRegressor(
-        [(n, clone(m)) for n, m in base_reg],
-        final_estimator=LinearRegression(positive=True),
-        cv=5,
-        n_jobs=1,
-    ),
-)
-stack = FIT_REG["Stacking"].named_steps["model"]
-print("Poids du méta-modèle :",
-      dict(zip([n for n, _ in base_reg], stack.final_estimator_.coef_.round(3))))
-table
-```
-
-Le méta-modèle donne surtout du poids à la régression Ridge (0,63) puis à la forêt aléatoire (0,35), et très peu au boosting (0,11). Le stacking obtient exactement la même RMSE que la régression Ridge (2,104 ans) : les modèles de base font des erreurs très proches, et les combiner n'apporte rien.
-
-## Comparaison des modèles de régression
-
-```{python}
-res_reg = pd.DataFrame(RES_REG).T.drop(columns="hyperparamètres").astype(float)
-res_reg.sort_values("RMSE test").round(4)
-```
-
-```{python}
-REF_REG = ("Moyenne", "Ridge", "Arbre")
-order = res_reg.sort_values("RMSE test", ascending=False)
-best_reg = next(n for n in order.index[::-1] if n not in REF_REG)
-
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
-colors = [GREY if n in REF_REG else BLUE for n in order.index]
-ax1.barh(order.index, order["RMSE test"], color=colors, height=0.6)
-ax1.errorbar(order["RMSE CV"], np.arange(len(order)), xerr=order["± CV"], fmt="o",
-             color=TEXT, markersize=4, elinewidth=1, label="RMSE CV (± écart-type)")
-for i, v in enumerate(order["RMSE test"]):
-    ax1.text(v + 0.005, i, f"{v:.3f}", va="center", fontsize=8, color=TEXT)
-ax1.set_xlim(order["RMSE test"].min() - 0.15, order["RMSE test"].max() + 0.1)
-ax1.set_xlabel("RMSE pondérée (ans) — barres : test")
-ax1.set_title("Erreur de prédiction")
-ax1.legend(loc="upper right")
-ax1.grid(axis="y", visible=False)
-
-bars = ax2.barh(order.index, order["R² test"] * 100, color=colors, height=0.6)
-ax2.bar_label(bars, fmt="%.1f %%", padding=3, fontsize=8, color=TEXT)
-ax2.set_xlabel("R² test (%, pondéré)")
-ax2.set_title("Part de variance expliquée")
-ax2.set_xlim(min(0, order["R² test"].min() * 100) - 1, order["R² test"].max() * 100 * 1.3)
-ax2.grid(axis="y", visible=False)
-plt.tight_layout()
-plt.show()
-```
-
-Tous les modèles ont un pouvoir prédictif faible : le R² ne dépasse pas 5 % et la RMSE passe de 2,157 ans pour la moyenne à 2,104 ans pour les meilleurs modèles. La régression Ridge, le gradient boosting et le stacking sont à égalité : leurs écarts (moins de 0,002 an) sont bien plus petits que l'écart-type entre les plis de validation croisée (environ 0,03). Les méthodes d'agrégation font mieux que l'arbre seul, mais pas mieux que la régression Ridge. Le lien entre les variables et l'âge au premier alcool semble donc essentiellement additif, et un modèle linéaire suffit à le capter.
-
-### Importance des variables
-
-Pour savoir quelles variables comptent, nous mesurons la hausse de la RMSE sur l'échantillon test quand on mélange au hasard les valeurs d'une variable (importance par permutation). Nous comparons la régression Ridge et le meilleur modèle d'agrégation.
-
-```{python}
-def importance(pipe, X, y, w, scoring):
-    r = permutation_importance(pipe, X, y, sample_weight=w.to_numpy(), scoring=scoring,
-                               n_repeats=20, random_state=SEED, n_jobs=N_JOBS)
-    return pd.Series(r.importances_mean, index=FEATURES)
-
-
-def plot_importance(imp: pd.DataFrame, ref: str, best: str, xlabel: str):
-    labels = [f"{v} · {VARIABLES[v][0]}" if v in VARIABLES else f"{v} · Situation (synthèse)"
-              for v in imp.index]
-    fig, ax = plt.subplots(figsize=(8, 5))
-    pos = np.arange(len(imp))
-    ax.barh(pos + 0.2, imp[best], height=0.38, color=BLUE, label=best)
-    ax.barh(pos - 0.2, imp[ref], height=0.38, color=GREY, label=ref)
-    ax.set_yticks(pos, labels)
-    ax.axvline(0, color=TEXT, linewidth=0.8)
-    ax.set_xlabel(xlabel)
-    ax.set_title("Importance des variables par permutation")
-    ax.legend(loc="lower right")
-    ax.grid(axis="y", visible=False)
-    plt.tight_layout()
-    plt.show()
-
-
-imp_reg = pd.DataFrame(
-    {n: importance(FIT_REG[n], Xr_test, yr_test, wr_test, "neg_root_mean_squared_error")
-     for n in ("Ridge", best_reg)}
-).sort_values(best_reg)
-plot_importance(imp_reg, "Ridge", best_reg,
-                "Hausse de la RMSE quand la variable est permutée (ans)")
-```
-
-Le sexe est la variable la plus importante, suivi de la consommation d'alcool du père puis de la mère. Viennent ensuite, loin derrière, le redoublement et les PCS des parents. Les autres variables n'apportent presque rien. La régression Ridge et le meilleur modèle d'agrégation s'accordent sur ce classement, ce qui confirme les observations de l'analyse descriptive.
-
-### Prédictions et valeurs observées
-
-Le graphique suivant montre, pour chaque âge observé, la prédiction moyenne du meilleur modèle d'agrégation et l'intervalle interquartile de ses prédictions.
-
-```{python}
-pred_best = FIT_REG[best_reg].predict(Xr_test)
-by_age = (
-    pd.DataFrame({"obs": yr_test, "pred": pred_best})
-    .groupby("obs")["pred"]
-    .agg(["mean", lambda p: p.quantile(0.25), lambda p: p.quantile(0.75), "size"])
-    .set_axis(["mean", "q1", "q3", "n"], axis=1)
-)
-by_age = by_age[by_age["n"] >= 10]
-
-fig, ax = plt.subplots(figsize=(7, 4))
-ax.fill_between(by_age.index, by_age["q1"], by_age["q3"], color="#cde2fb",
-                label="Prédictions : intervalle interquartile")
-ax.plot(by_age.index, by_age["mean"], marker="o", color=BLUE, linewidth=2, markersize=5,
-        markeredgecolor="white", label="Prédiction moyenne")
-lims = [by_age.index.min(), by_age.index.max()]
-ax.plot(lims, lims, color=TEXT, linestyle=":", linewidth=1, label="Prédiction parfaite")
-ax.set_xticks(by_age.index.astype(int))
-ax.set_xlabel("Âge observé (ans)")
-ax.set_ylabel("Âge prédit (ans)")
-ax.set_title(f"{best_reg} : prédictions sur le test")
-ax.legend(loc="upper left")
-plt.tight_layout()
-plt.show()
-
-print(f"Plage des prédictions : [{pred_best.min():.1f}, {pred_best.max():.1f}] ans "
-      f"(observé : [{yr_test.min():.0f}, {yr_test.max():.0f}])")
-```
-
-Les prédictions restent comprises entre 13 et 16 ans environ, quel que soit l'âge observé. Le modèle prédit un peu plus tôt pour les jeunes qui ont réellement commencé tôt, et un peu plus tard pour ceux qui ont commencé tard, mais les écarts sont très faibles : les prédictions restent proches de la moyenne. Les variables disponibles ne permettent donc pas de repérer les initiations très précoces ou très tardives.
-
-# Partie 2 : la classification
-
-## Les données
-
-Pour la classification, nous découpons l'âge au premier alcool en classes et nous gardons **tous les jeunes**, y compris ceux qui n'ont jamais bu :
+Nous découpons l'âge au premier alcool `Q19A` en trois classes et nous gardons **tous les jeunes**, y compris ceux qui n'ont jamais bu :
 
 | Classe | Contenu |
 |---|---|
@@ -542,15 +169,119 @@ Pour la classification, nous découpons l'âge au premier alcool en classes et n
 | ≥ 16 ans | initiation tardive |
 | Non concerné | n'a jamais bu (`Q19A` manquant) |
 
-Nous avons regroupé 14 et 15 ans : avec un découpage par quartiles (≤ 13 / 14 / 15 / ≥ 16), les modèles ne distinguaient pas les jeunes de 14 et de 15 ans. La classe 14-15 ans regroupe environ 41 % des jeunes.
-
-Les hyperparamètres sont choisis en minimisant la **log-loss** pondérée, qui évalue les probabilités prédites. Elle est plus stable que l'exactitude quand le signal est faible, car l'exactitude ne dépend que de la classe prédite. Nous reportons aussi l'exactitude, le F1 macro (moyenne des F1 de chaque classe) et l'AUC macro One-vs-Rest (capacité des probabilités à classer les individus, 0,5 correspondant au hasard).
+Nous avions d'abord découpé l'âge par quartiles, ce qui donnait quatre classes d'âge (≤ 13 / 14 / 15 / ≥ 16 ans). Mais les modèles ne distinguaient pas les jeunes de 14 et de 15 ans : ils leur attribuaient les mêmes probabilités, et la classe « 14 ans » n'était jamais prédite. Nous avons donc regroupé 14 et 15 ans, en fixant les seuils à la main (13 et 15 ans). Comme pour le prétraitement, les âges supérieurs à 25 ans, incohérents, sont supprimés.
 
 ```{python}
 df_clf = preprocess(load_escap_data(), thresholds=[13, 15])
 CLASSES = list(df_clf[TARGET_CLASS].cat.categories)
+CLASS_COLORS = ["#86b6ef", "#3987e5", "#1c5cab", GREY]  # précoce -> tardif, puis non concerné
 
-Xc, yc, wc = df_clf[FEATURES], df_clf[TARGET_CLASS].astype(str), df_clf[WEIGHT]
+drinkers = df_clf[TARGET].notna()
+ages, w_ages = df_clf.loc[drinkers, TARGET], df_clf.loc[drinkers, WEIGHT]
+dist = w_ages.groupby(ages).sum() / w_ages.sum() * 100
+class_idx = np.searchsorted([13, 15], dist.index, side="left")
+
+fig, ax = plt.subplots(figsize=(9, 4))
+ax.bar(dist.index, dist.values, color=[CLASS_COLORS[i] for i in class_idx], width=0.8)
+for t in (13, 15):
+    ax.axvline(t + 0.5, color=TEXT, linestyle=":", linewidth=1)
+for i in range(3):
+    ax.annotate(CLASSES[i], ((11, 14.5, 17.5)[i], dist.max() * 1.02),
+                ha="center", fontsize=8, color=TEXT, fontweight="bold")
+ax.set_xticks(dist.index.astype(int))
+ax.set_xlabel("Âge au premier alcool (ans)")
+ax.set_ylabel("Part des jeunes ayant déjà bu (%, pondéré)")
+ax.set_title("Découpage de l'âge au premier alcool en classes")
+ax.set_ylim(0, dist.max() * 1.12)
+ax.grid(axis="x", visible=False)
+plt.tight_layout()
+plt.show()
+```
+
+La coupure à 13 ans sépare les initiations précoces, et la coupure à 15 ans les initiations tardives. Les âges de 14 et 15 ans, les plus fréquents, forment à eux seuls la classe centrale.
+
+## Répartition des classes
+
+```{python}
+yc, wc = df_clf[TARGET_CLASS].astype(str), df_clf[WEIGHT]
+stats_class = pd.DataFrame(
+    {
+        "effectif": yc.value_counts().reindex(CLASSES),
+        "% pondéré": (wc.groupby(yc).sum().reindex(CLASSES) / wc.sum() * 100).round(1),
+        "âge moyen 1er alcool": (
+            df_clf[drinkers]
+            .groupby(TARGET_CLASS, observed=False)[[TARGET, WEIGHT]]
+            .apply(lambda g: np.average(g[TARGET], weights=g[WEIGHT]) if len(g) else np.nan)
+            .round(2)
+        ),
+    }
+)
+
+fig, ax = plt.subplots(figsize=(8, 3))
+bars = ax.barh(CLASSES, stats_class["% pondéré"], color=CLASS_COLORS, height=0.7)
+ax.bar_label(bars, fmt="%.1f %%", padding=3, fontsize=8, color=TEXT)
+ax.invert_yaxis()
+ax.set_xlim(0, stats_class["% pondéré"].max() * 1.2)
+ax.set_xlabel("Part (%, pondéré)")
+ax.set_title("Répartition des classes d'âge au premier alcool")
+ax.grid(axis="y", visible=False)
+plt.tight_layout()
+plt.show()
+
+print(f"Individus : {len(df_clf)}")
+stats_class
+```
+
+La classe centrale « 14-15 ans » regroupe 40,5 % des jeunes (pondéré). Les trois autres classes ont des tailles proches : 19,1 % de précoces, 22,1 % de tardifs et 18,3 % de jeunes n'ayant jamais bu. L'âge moyen au premier alcool est de 11,3 ans chez les précoces, 14,6 ans dans la classe centrale et 16,3 ans chez les tardifs. Un modèle qui prédirait toujours la classe « 14-15 ans » aurait donc déjà une exactitude d'environ 40 %.
+
+## Les classes selon quelques variables
+
+Avant de modéliser, nous avons regardé comment la répartition des classes varie selon le sexe et la consommation d'alcool des parents, les variables qui ressortaient de l'analyse descriptive. Les modalités de moins de 30 jeunes sont écartées.
+
+```{python}
+fig, axes = plt.subplots(3, 1, figsize=(9, 8.5), gridspec_kw={"height_ratios": [2, 5, 5]})
+for ax, var in zip(axes, ("Q03", "B08A", "B08B")):
+    data = pd.DataFrame({"mod": df_clf[var], "classe": df_clf[TARGET_CLASS], "w": wc})
+    counts = data["mod"].value_counts()
+    data = data[data["mod"].isin(counts[counts >= 30].index)]
+    tab = data.pivot_table(index="mod", columns="classe", values="w", aggfunc="sum",
+                           observed=True).reindex(columns=CLASSES)
+    tab = tab.div(tab.sum(axis=1), axis=0) * 100
+    left = np.zeros(len(tab))
+    for c, color in zip(CLASSES, CLASS_COLORS):
+        ax.barh(tab.index.astype(str), tab[c], left=left, color=color, height=0.7, label=c)
+        for y_, (l_, v) in enumerate(zip(left, tab[c])):
+            if v >= 6:
+                ax.text(l_ + v / 2, y_, f"{v:.0f}", ha="center", va="center", fontsize=7,
+                        color="white" if c != "≤ 13 ans" else "#0b0b0b")
+        left += tab[c].to_numpy()
+    ax.invert_yaxis()
+    ax.set_xlim(0, 100)
+    ax.set_title(f"{var} · {VARIABLES[var][0]}")
+    ax.grid(False)
+axes[-1].set_xlabel("Part de chaque classe (%, pondéré)")
+axes[0].legend(ncols=4, loc="upper center", bbox_to_anchor=(0.5, 1.9))
+plt.tight_layout()
+plt.show()
+```
+
+Les garçons sont plus souvent précoces que les filles (23 % contre 15 %), alors que les filles sont un peu plus souvent dans les classes « 14-15 ans » et « ≥ 16 ans ». La part de jeunes n'ayant jamais bu est proche pour les deux sexes (18 et 19 %).
+
+La consommation d'alcool des parents joue sur deux plans :
+
+- **sur le fait d'avoir bu ou non** : quand le père ne boit jamais à la maison, 41 % des jeunes n'ont jamais bu, contre 9 à 16 % quand il boit ; pour la mère, c'est 34 % contre 9 à 13 % ;
+- **sur la précocité** : plus les parents boivent souvent, plus les jeunes sont précoces. La part de « ≤ 13 ans » passe de 10 % quand le père ne boit jamais à 27 % quand il boit presque chaque jour (de 12 % à 29 % pour la mère), et la part de tardifs diminue.
+
+Ces variables devraient donc surtout aider à repérer les jeunes n'ayant jamais bu, et dans une moindre mesure les précoces.
+
+# Les modèles
+
+## Mise en place
+
+Les hyperparamètres sont choisis en minimisant la **log-loss** pondérée, qui évalue les probabilités prédites. Elle est plus stable que l'exactitude quand le signal est faible, car l'exactitude ne dépend que de la classe prédite. Nous reportons aussi l'exactitude, le F1 macro (moyenne des F1 de chaque classe) et l'AUC macro One-vs-Rest (capacité des probabilités à classer les individus, 0,5 correspondant au hasard).
+
+```{python}
+Xc = df_clf[FEATURES]
 Xc_train, Xc_test, yc_train, yc_test, wc_train, wc_test = train_test_split(
     Xc, yc, wc, test_size=0.2, stratify=yc, random_state=SEED
 )
@@ -588,9 +319,7 @@ def evaluate_clf(name, estimator, grid=None):
     return result_table(RES_CLF[name], name)
 
 
-print(f"Individus : {len(df_clf)} — apprentissage : {len(Xc_train)}, test : {len(Xc_test)}")
-shares = wc.groupby(yc).sum().reindex(CLASSES) / wc.sum() * 100
-pd.DataFrame({"effectif": yc.value_counts().reindex(CLASSES), "% pondéré": shares.round(1)})
+print(f"Apprentissage : {len(Xc_train)} — test : {len(Xc_test)}")
 ```
 
 ## Les modèles de référence
@@ -652,7 +381,7 @@ print(nonzero.sum().to_string(), f"\nsur {len(coef_names)} coefficients par clas
 nonzero[~nonzero.all(axis=1)]
 ```
 
-Le lasso ne garde que 41 coefficients sur 67 sans perdre en performance. Il écarte toutes les indicatrices de non-réponse et une partie des modalités de `SITUATION`, du lieu de vie, de la vie, de la situation et de la PCS des parents : une fois les autres variables connues, ces modalités n'apportent rien de plus.
+Le lasso ne garde que 41 coefficients sur 67 sans perdre en performance. Il écarte les indicatrices de non-réponse du sexe, du redoublement et des difficultés de lecture et d'écriture (mais garde celles de la consommation d'alcool des parents), ainsi qu'une partie des modalités de `SITUATION`, du lieu de vie, de la vie, de la situation et de la PCS des parents : une fois les autres variables connues, ces modalités n'apportent rien de plus.
 
 ### L'arbre de décision
 
@@ -763,7 +492,7 @@ XGBoost retrouve les mêmes réglages que le gradient boosting (profondeur 2, 60
 
 ## Le stacking
 
-Comme pour la régression, le stacking combine trois modèles de nature différente : la régression logistique ridge, la forêt aléatoire et le boosting par histogrammes. Leurs probabilités prédites, obtenues par validation croisée interne, alimentent une régression logistique.
+Le stacking combine trois modèles de nature différente : la régression logistique ridge, la forêt aléatoire et le boosting par histogrammes. Leurs probabilités prédites, obtenues par validation croisée interne, alimentent une régression logistique.
 
 ```{python}
 base_clf = [
@@ -785,7 +514,7 @@ evaluate_clf(
 
 Le stacking obtient la meilleure log-loss (1,232) et la meilleure AUC (0,652). Le gain reste faible par rapport aux autres méthodes d'agrégation.
 
-## Comparaison des modèles de classification
+## Comparaison des modèles
 
 ```{python}
 res_clf = pd.DataFrame(RES_CLF).T.drop(columns="hyperparamètres").astype(float)
@@ -825,7 +554,9 @@ plt.show()
 
 Tous les modèles battent la classe majoritaire, mais les écarts entre eux sont faibles. Les méthodes d'agrégation (en bleu) font un peu mieux que les modèles de référence (en gris) : elles réduisent la log-loss de 6,6 à 7,0 %, contre 5,9 % pour les régressions logistiques. Entre les méthodes d'agrégation, les écarts de log-loss sont du même ordre que l'écart-type de la validation croisée (environ 0,006) : on ne peut pas vraiment les départager. L'exactitude ne dépasse pas 45,5 %, soit moins de 5 points de plus que la classe majoritaire.
 
-### Matrice de confusion du meilleur modèle
+## Analyse du meilleur modèle
+
+### Matrice de confusion
 
 Nous analysons maintenant le meilleur modèle d'agrégation. Dans la matrice de confusion, chaque ligne correspond à la classe observée et somme à 100 %.
 
@@ -904,9 +635,32 @@ Les jeunes n'ayant jamais bu sont les mieux repérés (AUC de 0,74) : le modèle
 
 ### Importance des variables
 
-Comme pour la régression, nous mesurons la hausse de la log-loss quand on permute une variable.
+Pour savoir quelles variables comptent, nous mesurons la hausse de la log-loss sur l'échantillon test quand on mélange au hasard les valeurs d'une variable (importance par permutation). Nous comparons la régression logistique ridge et le meilleur modèle d'agrégation.
 
 ```{python}
+def importance(pipe, X, y, w, scoring):
+    r = permutation_importance(pipe, X, y, sample_weight=w.to_numpy(), scoring=scoring,
+                               n_repeats=20, random_state=SEED, n_jobs=N_JOBS)
+    return pd.Series(r.importances_mean, index=FEATURES)
+
+
+def plot_importance(imp: pd.DataFrame, ref: str, best: str, xlabel: str):
+    labels = [f"{v} · {VARIABLES[v][0]}" if v in VARIABLES else f"{v} · Situation (synthèse)"
+              for v in imp.index]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    pos = np.arange(len(imp))
+    ax.barh(pos + 0.2, imp[best], height=0.38, color=BLUE, label=best)
+    ax.barh(pos - 0.2, imp[ref], height=0.38, color=GREY, label=ref)
+    ax.set_yticks(pos, labels)
+    ax.axvline(0, color=TEXT, linewidth=0.8)
+    ax.set_xlabel(xlabel)
+    ax.set_title("Importance des variables par permutation")
+    ax.legend(loc="lower right")
+    ax.grid(axis="y", visible=False)
+    plt.tight_layout()
+    plt.show()
+
+
 imp_clf = pd.DataFrame(
     {n: importance(FIT_CLF[n], Xc_test, yc_test, wc_test, "neg_log_loss")
      for n in ("Logistique ridge", best_clf)}
@@ -917,58 +671,12 @@ plot_importance(imp_clf, "Logistique ridge", best_clf,
 
 La consommation d'alcool des parents domine très nettement : permuter celle de la mère ou celle du père fait perdre bien plus que toute autre variable. Viennent ensuite le sexe, puis la PCS de la mère, la vie des parents et `SITUATION`. Les difficultés de lecture et d'écriture n'apportent rien.
 
-# Comparaison des deux approches
+# Conclusion
 
-Les deux approches ne se comparent pas directement : elles n'ont ni la même population (seulement les jeunes ayant déjà bu pour la régression, tous les jeunes pour la classification), ni les mêmes métriques. Nous comparons donc, pour chacune, le meilleur modèle à son modèle de référence.
+- **Le pouvoir prédictif est faible.** Le meilleur modèle, le stacking, réduit la log-loss de 7 % par rapport à la classe majoritaire, et son exactitude (45,3 %) ne dépasse la référence (40,7 %) que de moins de 5 points. Les variables disponibles, qui décrivent la situation personnelle et le contexte familial, n'expliquent qu'une petite partie de l'âge au premier alcool.
+- **Les méthodes d'agrégation font un peu mieux que les modèles simples.** Elles réduisent la log-loss de 6,6 à 7,0 %, contre 5,9 % pour les régressions logistiques et 5,3 % pour l'arbre seul. Entre elles, les écarts restent de l'ordre de l'incertitude de la validation croisée : bagging, forêt aléatoire, boosting, XGBoost et stacking sont pratiquement équivalents.
+- **Le modèle prédit presque toujours la classe « 14-15 ans ».** Environ 82 % des jeunes y sont classés, et les classes « ≤ 13 ans » et « ≥ 16 ans » ne sont presque jamais prédites. Seuls les jeunes n'ayant jamais bu sont en partie reconnus (43 % bien classés, AUC de 0,74).
+- **Le signal existe mais reste faible.** Les probabilités prédites s'écartent des fréquences de base dans le bon sens, en particulier pour les jeunes n'ayant jamais bu et pour les précoces (AUC de 0,67), mais pas assez pour changer la classe prédite.
+- **La consommation d'alcool des parents est de loin la variable la plus importante**, suivie du sexe. Cela rejoint l'analyse des classes : la consommation des parents distingue surtout les jeunes n'ayant jamais bu, et dans une moindre mesure les précoces.
 
-```{python}
-best_reg_all = res_reg["RMSE test"].idxmin()
-best_clf_all = res_clf["log-loss test"].idxmin()
-pd.DataFrame(
-    {
-        "Régression": {
-            "Population": f"déjà buveurs ({len(df_reg)})",
-            "Meilleur modèle": best_reg_all,
-            "Métrique principale": "RMSE (ans)",
-            "Référence": round(res_reg.loc["Moyenne", "RMSE test"], 3),
-            "Meilleur modèle (valeur)": round(res_reg.loc[best_reg_all, "RMSE test"], 3),
-            "Gain (%)": round((1 - res_reg.loc[best_reg_all, "RMSE test"]
-                               / res_reg.loc["Moyenne", "RMSE test"]) * 100, 1),
-            "Autre indicateur": f"R² = {res_reg.loc[best_reg_all, 'R² test']:.1%}",
-        },
-        "Classification": {
-            "Population": f"tous les jeunes ({len(df_clf)})",
-            "Meilleur modèle": best_clf_all,
-            "Métrique principale": "log-loss",
-            "Référence": round(baseline, 3),
-            "Meilleur modèle (valeur)": round(res_clf.loc[best_clf_all, "log-loss test"], 3),
-            "Gain (%)": round(res_clf.loc[best_clf_all, "gain log-loss vs référence (%)"], 1),
-            "Autre indicateur": f"AUC = {res_clf.loc[best_clf_all, 'AUC macro test']:.3f}",
-        },
-    }
-)
-```
-
-Nous comparons aussi le classement des variables par les meilleurs modèles d'agrégation des deux approches (rang 1 = variable la plus importante).
-
-```{python}
-ranks = pd.DataFrame(
-    {
-        f"Régression ({best_reg})": imp_reg[best_reg].rank(ascending=False).astype(int),
-        f"Classification ({best_clf})": imp_clf[best_clf].rank(ascending=False).astype(int),
-    }
-)
-ranks.index = [f"{v} · {VARIABLES[v][0]}" if v in VARIABLES else f"{v} · Situation (synthèse)"
-               for v in ranks.index]
-ranks.sort_values(ranks.columns[1])
-```
-
-Les deux approches mènent aux mêmes conclusions générales :
-
-- **le pouvoir prédictif est faible** : le meilleur modèle réduit l'erreur de seulement 2,5 % en régression (R² inférieur à 5 %) et de 7 % en classification. Les variables disponibles, qui décrivent la situation personnelle et le contexte familial, n'expliquent qu'une petite partie de l'âge au premier alcool ;
-- **les méthodes d'agrégation apportent peu** : en régression, elles ne font pas mieux que la régression Ridge ; en classification, elles font un peu mieux que les régressions logistiques, mais les écarts restent de l'ordre de l'incertitude de la validation croisée. Le stacking est le meilleur modèle d'agrégation dans les deux cas, sans gain net ;
-- **les mêmes variables ressortent** : le sexe et la consommation d'alcool des parents dominent dans les deux approches, loin devant les autres variables.
-
-L'ordre des variables diffère toutefois. En régression, le sexe arrive en tête, alors qu'en classification ce sont les consommations d'alcool de la mère et du père. Cela s'explique par la population : la classification inclut les jeunes qui n'ont jamais bu, et la consommation des parents distingue surtout les abstinents (les jeunes dont les parents ne boivent jamais sont beaucoup plus souvent « Non concerné »).
-
-La classification apporte donc une information que la régression ne donne pas : elle repère en partie les jeunes qui n'ont jamais bu (AUC de 0,74 pour cette classe). En revanche, aucune des deux approches ne parvient à repérer les initiations précoces ou tardives. Pour mieux les détecter, on pourrait modifier la règle de décision de la classification (seuils sur les probabilités ou pondération des classes), au prix d'une exactitude plus faible.
+Pour mieux repérer les précoces et les tardifs, on pourrait modifier la règle de décision, par exemple en fixant des seuils sur les probabilités ou en pondérant les classes (`class_weight`), au prix d'une exactitude plus faible.

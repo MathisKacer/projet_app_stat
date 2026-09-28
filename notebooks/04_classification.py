@@ -29,8 +29,9 @@
 #
 # Les mêmes que pour la régression (`data/features.py`), pour les mêmes raisons :
 # sexe, redoublement, difficultés de lecture / écriture, consommation d'alcool
-# des parents (scores ordinaux + indicatrice de non-réponse), `SITUATION`, lieu
-# de vie, vie des parents, situation et PCS des parents (indicatrices).
+# des parents, `SITUATION`, lieu de vie, vie des parents, situation et PCS des
+# parents, toutes encodées en indicatrices (« Non répondu » en modalité à part,
+# sans imputation).
 # Exclues : `A01` (identifiant), `pm17B` (pondération), `Q04`/`Q04A`/`Q04B`
 # (résumées par `SITUATION`), `Q19A` (la cible continue : fuite d'information).
 #
@@ -216,8 +217,8 @@ def evaluate(name, estimator, grid=None):
 #     variables) ;
 #   - **elastic net** : mélange des deux, `l1_ratio` étant la part de L1.
 #
-#   Les variables ne sont pas standardisées (scores ordinaux de 1 à k et
-#   indicatrices 0/1, d'échelles proches).
+#   Les variables ne sont pas standardisées (ce sont toutes des indicatrices
+#   0/1).
 # - **Arbre de décision** seul.
 
 # %%
@@ -560,7 +561,8 @@ plt.show()
 #   en 5 fois moins de temps.
 # - **Ridge, lasso, elastic net** : scores identiques (log-loss 1,247-1,248,
 #   AUC 0,645-0,646). Le lasso (C = 0,1) ne garde que 41 coefficients sur 67 :
-#   il écarte les indicatrices de non-réponse et une partie des modalités de
+#   il écarte les indicatrices de non-réponse (sauf celles de `B08A` et `B08B`)
+#   et une partie des modalités de
 #   `SITUATION`, du lieu de vie, de la vie, de la situation et de la PCS des
 #   parents, sans perte de performance. Ces modalités n'apportent donc rien de plus une fois
 #   les autres connues, ce qui rejoint l'importance par permutation.

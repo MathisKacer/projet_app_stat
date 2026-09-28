@@ -17,22 +17,19 @@
 #
 # | Variable | Contenu | Encodage | Pourquoi |
 # |---|---|---|---|
-# | `Q03` | Sexe | binaire | les garçons commencent plus tôt (≈ 0,4 an) |
-# | `Q05` | Redoublement | binaire | lié à un âge plus tardif |
-# | `Q06A`, `Q06B` | Difficultés lecture / écriture | ordinal 1-3 | idem, gradient visible |
-# | `B08A`, `B08B` | Père / mère boit à la maison | ordinal 1-5 | effet le plus fort et monotone (14,8 → 13,4 ans) |
+# | `Q03` | Sexe | one-hot | les garçons commencent plus tôt (≈ 0,4 an) |
+# | `Q05` | Redoublement | one-hot | lié à un âge plus tardif |
+# | `Q06A`, `Q06B` | Difficultés lecture / écriture | one-hot | idem, gradient visible |
+# | `B08A`, `B08B` | Père / mère boit à la maison | one-hot | effet le plus fort et monotone (14,8 → 13,4 ans) |
 # | `SITUATION` | Études / arrêt × type | one-hot | résume `Q04`, `Q04A`, `Q04B` sans redondance |
 # | `Q08` | Lieu de vie | one-hot | « propre logement » plus précoce |
 # | `Q08C` | Vie des parents | one-hot | contexte familial |
 # | `Q09A1`, `Q09B1` | Situation du père / de la mère | one-hot | contexte socio-économique |
 # | `Q10A1`, `Q10B1` | PCS du père / de la mère | one-hot | enfants de cadres et d'agriculteurs plus précoces |
 #
-# - **Ordinales** : le score conserve l'ordre des modalités (un seul coefficient
-#   pour la régression, des seuils naturels pour les arbres). « Non répondu »
-#   est imputé par la médiane **et** signalé par une indicatrice, car la
-#   non-réponse n'est pas aléatoire.
-# - **Nominales** : indicatrices ; « Non répondu » et « Non concerné » sont des
-#   modalités à part entière ; les modalités de moins de 30 individus sont
+# - **Toutes les variables** (ordinales comprises) sont encodées en
+#   indicatrices : « Non répondu » et « Non concerné » sont des modalités à part
+#   entière, sans imputation ; les modalités de moins de 30 individus sont
 #   regroupées.
 # - **Exclues** : `A01` (identifiant), `pm17B` (poids de sondage : utilisé comme
 #   pondération à l'apprentissage et dans les métriques, pas comme prédicteur),
