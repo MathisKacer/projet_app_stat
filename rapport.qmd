@@ -811,17 +811,18 @@ pd.DataFrame(
 #| tbl-cap: "Modalités écartées par le lasso, et par l'elastic net"
 
 
+from IPython.display import Markdown
+
 dropped = nonzero[~nonzero["Logistique lasso"]]
-split = [n.split("_", 1) for n in dropped.index]
-pd.DataFrame(
-    {
-        "Variable": [var_label(v) for v, _ in split],
-        "Modalité écartée par le lasso": [
-            "modalités rares regroupées" if m == "infrequent_sklearn" else m for _, m in split
-        ],
-        "Écartée aussi par l'elastic net": np.where(dropped["Logistique elastic net"], "non", "oui"),
-    }
-).set_index("Variable")
+lines = [
+    "| Variable | Modalité écartée par le lasso | Écartée aussi par l'elastic net |",
+    "|:---|:---|:---:|",
+]
+for name, kept_enet in zip(dropped.index, dropped["Logistique elastic net"]):
+    var, mod = name.split("_", 1)
+    mod = "modalités rares regroupées" if mod == "infrequent_sklearn" else mod
+    lines.append(f"| {var_label(var)} | {mod} | {'non' if kept_enet else 'oui'} |")
+Markdown("\n".join(lines))
 ```
 
 Le lasso ne garde que 52 indicatrices sur 81, sans perdre en performance. L'elastic net en écarte 14, qui font toutes partie des 29 écartées par le lasso, et le ridge n'en écarte aucune. Le lasso écarte les modalités « Parfois » et « Souvent » des difficultés de lecture, la plupart des non-réponses (redoublement, difficultés d'écriture, lieu de vie, vie des parents, situation du père) et une partie des modalités de `SITUATION`, du lieu de vie, de la vie, de la situation et de la PCS des parents : une fois les autres variables connues, ces modalités n'apportent rien de plus. À l'inverse, il garde toutes les modalités de la consommation d'alcool du père et de la mère, y compris leur non-réponse.
